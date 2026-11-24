@@ -242,7 +242,6 @@ impl Ctx {
         app.set_loading(started && s.waiting_for_playback);
         app.set_position(s.position);
         app.set_track_format(s.format.as_str().into());
-        app.set_personal_version(s.format.ends_with(" · Личная версия"));
         app.set_duration(s.duration);
         app.set_volume(s.volume);
         app.set_shuffle(s.shuffle);

@@ -203,7 +203,15 @@ if [ "$DMG_ON" -eq 1 ]; then
   cp -R "$APP" "$STAGE/"
   ln -s /Applications "$STAGE/Applications"
   rm -f "$DMG"
-  hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+  # Hosted macOS runners occasionally fail to attach a newly created disk image.
+  # Keep diagnostics visible and retry the same local packaging operation.
+  for attempt in 1 2 3; do
+    if hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG"; then
+      break
+    fi
+    if [ "$attempt" -eq 3 ]; then exit 1; fi
+    sleep 3
+  done
   rm -rf "$STAGE"
   hdiutil verify "$DMG" >/dev/null
   echo "$DMG"

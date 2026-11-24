@@ -114,6 +114,9 @@ fn transcript(pcm: &[i16]) -> Option<Vec<String>> {
         whisper_rs::install_logging_hooks();
         let path = crate::config::dir().join("ggml-small-q5_1.bin");
         if !path.is_file() {
+            #[cfg(target_os = "android")]
+            return crate::sys::speech_model().map(Mutex::new);
+            #[cfg(not(target_os = "android"))]
             return None;
         }
         WhisperContext::new_with_params(path, WhisperContextParameters::default())
@@ -292,6 +295,23 @@ pub(crate) fn compare(original: &Recording, candidate: &Recording, lyrics: &Lyri
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires a real external recording downloaded by the authenticated service"]
+    fn external_recording_pair() {
+        let dir = std::path::PathBuf::from(std::env::var_os("YM_VERIFICATION_FIXTURES").unwrap());
+        let read = |path: std::path::PathBuf| Recording::decode(
+            rodio::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap(), 174000).unwrap();
+        let baseline = read(dir.join("groupie-ym.mp3"));
+        let alternative = read(std::env::var_os("YM_EXTERNAL_AUDIO").unwrap().into());
+        let lyrics = Lyrics { synced: crate::api::parse_lrc(&std::fs::read_to_string(dir.join("groupie.lrc")).unwrap()), ..Default::default() };
+        assert_eq!(compare(&baseline, &baseline, &lyrics), None);
+        assert_eq!(compare(&baseline, &read(dir.join("groupie-recoded.mp3")), &lyrics), None);
+        assert_eq!(compare(&alternative, &baseline, &lyrics), None);
+        let restored = compare(&baseline, &alternative, &lyrics);
+        eprintln!("external recording: restored speech at {restored:?}");
+        assert!(restored.is_some());
+    }
+
     #[test]
     #[ignore = "local recording pairs in YM_VERIFICATION_FIXTURES"]
     fn real_recording_pairs() {

@@ -2,10 +2,8 @@
 
 use crate::api::{Api, Res, Track};
 use serde::Deserialize;
-use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const MATCH_TOLERANCE_MS: u64 = 2000;
@@ -36,27 +34,9 @@ impl<T: Clone> LookupCache<T> {
 
 #[derive(Default)]
 pub(crate) struct Originals {
-    playlist: OnceLock<PlaylistUploads>,
     catalog: LookupCache<Vec<String>>,
     verified: LookupCache<f32>,
     russian: LookupCache<bool>,
-}
-
-#[derive(Deserialize)]
-struct Entry {
-    upload_id: String,
-    duration_ms: u64,
-}
-
-#[derive(Deserialize)]
-struct Library {
-    account_uid: String,
-    tracks: HashMap<String, Entry>,
-}
-
-#[derive(Default)]
-struct PlaylistUploads {
-    by_recording: HashMap<(String, Vec<String>), Vec<Entry>>,
 }
 
 fn normalized(text: &str) -> String {
@@ -69,107 +49,6 @@ fn recording(title: &str, artists: impl Iterator<Item = String>) -> Option<(Stri
     artists.sort_unstable();
     artists.dedup();
     (!title.is_empty() && !artists.is_empty()).then_some((title, artists))
-}
-
-impl PlaylistUploads {
-    fn from_entries(entries: Vec<Value>) -> Self {
-        let mut library = Self::default();
-        for entry in entries {
-            let track = &entry["track"];
-            let Some(id) = track["id"].as_str().filter(|id| valid_upload_id(id)) else { continue };
-            if track["trackSource"].as_str() != Some("UGC") || track["state"].as_str() != Some("playable")
-                || track["available"].as_bool() != Some(true)
-            {
-                continue;
-            }
-            let Some(title) = track["title"].as_str() else { continue };
-            let Some(artists) = track["ugcArtistName"].as_str() else { continue };
-            let Some(duration_ms) = track["durationMs"].as_u64().filter(|duration| *duration > 0) else { continue };
-            if let Some(key) = recording(title, artists.split(',').map(String::from)) {
-                library.by_recording.entry(key).or_default().push(Entry { upload_id: id.into(), duration_ms });
-            }
-        }
-        library
-    }
-
-    fn candidates(&self, track: &Track) -> Vec<&str> {
-        let title = if track.version.is_empty() { track.title.clone() } else { format!("{} ({})", track.title, track.version) };
-        let key = recording(&title, track.artist_list.iter().map(|artist| artist.name.clone()));
-        key.and_then(|key| self.by_recording.get(&key)).into_iter().flatten()
-            .filter(|entry| entry.duration_ms.abs_diff(track.duration_ms) <= MATCH_TOLERANCE_MS)
-            .map(|entry| entry.upload_id.as_str()).collect()
-    }
-}
-
-impl Library {
-    fn candidate(&self, catalog_id: &str, duration_ms: u64) -> Option<&str> {
-        let entry = self.tracks.get(catalog_id)?;
-        (duration_ms > 0
-            && entry.duration_ms > 0
-            && entry.duration_ms.abs_diff(duration_ms) <= MATCH_TOLERANCE_MS
-            && valid_upload_id(&entry.upload_id))
-            .then_some(entry.upload_id.as_str())
-    }
-}
-
-fn valid_upload_id(id: &str) -> bool {
-    id.len() == 36 && id.bytes().enumerate().all(|(index, byte)| match index {
-        8 | 13 | 18 | 23 => byte == b'-',
-        _ => byte.is_ascii_hexdigit(),
-    })
-}
-
-fn bundle_library() -> Option<PathBuf> {
-    let executable = std::env::current_exe().ok()?;
-    Some(executable.parent()?.parent()?.join("Resources").join("originals.json"))
-}
-
-fn read_library() -> Option<Library> {
-    let config_path = crate::config::dir().join("originals.json");
-    let path = std::env::var_os("ANCENSOR_LIBRARY").map(PathBuf::from).or_else(|| {
-        if config_path.is_file() { Some(config_path) } else { bundle_library() }
-    })?;
-    match std::fs::read(&path) {
-        Ok(contents) => match serde_json::from_slice(&contents) {
-            Ok(library) => Some(library),
-            Err(error) => {
-                crate::config::log(format!("Не удалось прочитать таблицу личных версий: {error}"));
-                None
-            }
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            crate::config::log(format!("Не удалось открыть таблицу личных версий: {error}"));
-            None
-        }
-    }
-}
-
-pub fn prepare(api: &Api) {
-    api.originals.playlist.get_or_init(|| match api.original_playlist_entries() {
-        Ok(entries) => PlaylistUploads::from_entries(entries),
-        Err(error) => {
-            crate::config::log(format!("Не удалось прочитать личный плейлист: {error}"));
-            PlaylistUploads::default()
-        }
-    });
-}
-
-pub fn mapped_upload(api: &Api, track: &Track) -> Option<&'static str> {
-    static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
-    if let Some(library) = LIBRARY.get_or_init(read_library).as_ref() {
-        if let Some(id) = library.candidate(&track.id, track.duration_ms) {
-            if api.account_uid().ok().as_deref() == Some(library.account_uid.as_str()) {
-                return Some(id);
-            }
-        }
-    }
-    None
-}
-
-pub fn playlist_candidates<'a>(api: &'a Api, track: &Track) -> Vec<&'a str> {
-    prepare(api);
-    api.originals.playlist.get().map_or_else(Vec::new, |p| p.candidates(track))
 }
 
 pub fn verified(api: &Api, original: &crate::verification::Recording, candidate: &crate::verification::Recording, lyrics: &crate::api::Lyrics) -> Option<f32> {
@@ -267,12 +146,13 @@ fn recording_query(track: &Track) -> Option<String> {
     Some(format!("{title} {}", track.artists))
 }
 
-use crate::resolver_login::{self, BASE as RESOLVER};
+use crate::resolver_login;
 
 #[derive(Deserialize)]
 pub struct OnlineCandidate {
     source: String,
     ticket: String,
+    pub next: Option<String>,
 }
 
 pub fn online_candidates(track: &Track) -> Res<Vec<OnlineCandidate>> {
@@ -283,18 +163,29 @@ pub fn online_candidates(track: &Track) -> Res<Vec<OnlineCandidate>> {
     let version = normalized(&track.version);
     let title = if version.is_empty() || variant(&version).is_some() { base.to_owned() } else { format!("{base} ({version})") };
     let artists: Vec<_> = track.artist_list.iter().map(|a| &a.name).collect();
-    let response = resolver_login::http()?.post(format!("{RESOLVER}/search")).bearer_auth(token)
-        .timeout(Duration::from_secs(19))
-        .json(&serde_json::json!({"title":title, "artists":artists, "duration_ms":track.duration_ms}))
+    let response = resolver_login::signed("POST", "/search", &token, serde_json::to_vec(&serde_json::json!({"title":title,"artists":artists,"duration_ms":track.duration_ms})).map_err(|e|e.to_string())?)?
+        .timeout(Duration::from_secs(24))
         .send().and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
     let candidates: Vec<OnlineCandidate> = serde_json::from_reader(response.take(16 * 1024)).map_err(|e| e.to_string())?;
     Ok(candidates.into_iter().filter(|c| c.ticket.len() == 32 && c.ticket.bytes().all(|b| b.is_ascii_hexdigit())
         && matches!(c.source.as_str(), "Bandcamp" | "SoundCloud" | "YouTube Music")).take(12).collect())
 }
 
+pub fn online_next(next: &str) -> Res<Vec<OnlineCandidate>> {
+    use std::io::Read;
+    if next.len()!=32 || !next.bytes().all(|b|b.is_ascii_hexdigit()) { return Ok(vec![]); }
+    let token = resolver_login::credential().ok_or("Внешние источники отключены")?;
+    let body = serde_json::to_vec(&serde_json::json!({"next":next})).map_err(|e|e.to_string())?;
+    let response = resolver_login::signed("POST", "/next", &token, body)?.timeout(Duration::from_secs(24))
+        .send().and_then(|r|r.error_for_status()).map_err(|e|e.to_string())?;
+    let candidates: Vec<OnlineCandidate> = serde_json::from_reader(response.take(16*1024)).map_err(|e|e.to_string())?;
+    Ok(candidates.into_iter().filter(|c|c.ticket.len()==32 && c.ticket.bytes().all(|b|b.is_ascii_hexdigit())
+        && matches!(c.source.as_str(),"Bandcamp"|"SoundCloud"|"YouTube Music")).take(12).collect())
+}
+
 pub fn online_audio(candidate: &OnlineCandidate) -> Res<(std::sync::Arc<crate::stream::Buf>, String)> {
     let token = resolver_login::credential().ok_or("Сначала подключите внешние источники")?;
-    let response = resolver_login::http()?.get(format!("{RESOLVER}/audio/{}", candidate.ticket)).bearer_auth(token)
+    let response = resolver_login::signed("GET", &format!("/audio/{}",candidate.ticket), &token, vec![])?
         .timeout(Duration::from_secs(48)).send().and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
     let buf = crate::stream::Buf::from_media(response).map_err(|e| e.to_string())?;
     Ok((buf, format!("MP3 · {}", candidate.source)))
@@ -317,40 +208,6 @@ mod tests {
         assert!(!should_uncensor(&api, &foreign, || panic!("cached foreign language")));
         let unknown = make(4, "Instrumental");
         assert!(!should_uncensor(&api, &unknown, || None));
-    }
-
-    #[test]
-    fn chooses_only_the_exact_catalog_recording_with_a_compatible_duration() {
-        let library: Library = serde_json::from_str(r#"{
-            "account_uid": "42",
-            "tracks": {
-                "123": {"upload_id": "00000000-0000-4000-8000-000000000001", "duration_ms": 120000},
-                "124": {"upload_id": "https://example.org/song.mp3", "duration_ms": 120000}
-            }
-        }"#).unwrap();
-        assert_eq!(library.candidate("123", 121000), Some("00000000-0000-4000-8000-000000000001"));
-        assert_eq!(library.candidate("123", 125000), None);
-        assert_eq!(library.candidate("123", 0), None);
-        assert_eq!(library.candidate("124", 120000), None);
-        assert_eq!(library.candidate("125", 120000), None);
-    }
-
-    #[test]
-    fn playlist_only_supplies_matching_candidates_for_audio_verification() {
-        let track = crate::api::parse_track(&serde_json::json!({
-            "id": 123, "title": "Moonlight", "durationMs": 120000,
-            "artists": [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}]
-        })).unwrap();
-        let row = |id: &str, artists: &str| serde_json::json!({"track": {
-            "id": id, "title": " Moonlight ", "ugcArtistName": artists,
-            "durationMs": 120500, "trackSource": "UGC", "state": "playable", "available": true,
-        }});
-        let first = "00000000-0000-4000-8000-000000000001";
-        let second = "00000000-0000-4000-8000-000000000002";
-        let library = PlaylistUploads::from_entries(vec![row(first, "B, A"), row(second, "C")]);
-        assert_eq!(library.candidates(&track), vec![first]);
-        let ambiguous = PlaylistUploads::from_entries(vec![row(first, "B, A"), row(second, "A, B")]);
-        assert_eq!(ambiguous.candidates(&track), vec![first, second]);
     }
 
     #[test]

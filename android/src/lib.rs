@@ -571,7 +571,7 @@ fn start_login(ui: &App, player: Player) {
             Ok(c) => c,
             Err(e) => return set(String::new(), format!("Не удалось получить код: {e}")),
         };
-        set(code.user_code.clone(), "Откройте ya.ru/device и введите этот код. Можно на этом же телефоне.".into());
+        set(code.user_code.clone(), "Введите код на ya.ru/device. Затем подтвердите поиск версий без цензуры через Яндекс ID.".into());
         let deadline = std::time::Instant::now() + Duration::from_secs(code.expires_in);
         while std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_secs(code.interval));
@@ -590,6 +590,9 @@ fn start_login(ui: &App, player: Player) {
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak.upgrade() {
                             logged_in(&ui, &token.access, &player);
+                            if crate::resolver_login::credential().is_none() && crate::api::allow_explicit() {
+                                profile::connect_sources(&ui);
+                            }
                         }
                     });
                     return;

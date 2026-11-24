@@ -142,6 +142,7 @@ enum Msg {
     Batch { res: Res<Batch>, replace: bool, gen: u64 },
     Audio { gen: u64, res: Res<Audio> },
     Prefetch { gen: u64, id: String, res: Res<Audio> },
+    Replacement { gen: u64, credential: Option<String>, audio: Option<Audio> },
     Resume { gen: u64, res: Res<Option<Resume>> },
     Error(String),
 }
@@ -358,12 +359,15 @@ const YNISON_EVERY: Duration = Duration::from_secs(60);
 const STALL_LIMIT: Duration = Duration::from_secs(3);
 
 fn load_track(api: &Api, t: &Track) -> Res<Audio> {
-    let mut original = None;
+    load_audio(api, &t.id)
+}
+
+fn resolve_track(api: &Api, t: &Track, buf: Arc<Buf>) -> Option<Audio> {
+    static WORKER: Mutex<()> = Mutex::new(());
+    let _worker = WORKER.try_lock().ok()?;
+    let mut original = Some((buf.clone(), open_decoder(&buf).ok()?, String::new()));
     let eligible = crate::api::allow_explicit() && crate::originals::should_uncensor(api, t, || {
-        let audio = load_audio(api, &t.id).ok()?;
-        let sample = open_decoder(&audio.0);
-        original = Some(audio);
-        crate::language::vocal_language(sample.ok()?, t.duration_ms)
+        crate::language::vocal_language(open_decoder(&buf).ok()?, t.duration_ms)
     });
     if eligible {
         use crate::{originals, verification::Recording};
@@ -390,22 +394,27 @@ fn load_track(api: &Api, t: &Track) -> Res<Audio> {
             let (buf, decoder, format) = load_audio(api, id).ok()?;
             check((buf, decoder, format!("{format} · {label}")))
         };
-        if let Some(audio) = originals::mapped_upload(api, t).and_then(|id| try_yandex(id, "Личная версия")) { return Ok(audio); }
-        for id in originals::playlist_candidates(api, t) {
-            if let Some(audio) = try_yandex(id, "Личная версия") { return Ok(audio); }
-        }
         for id in originals::catalog_versions(api, t) {
-            if let Some(audio) = try_yandex(&id, "Без цензуры") { return Ok(audio); }
+            if let Some(audio) = try_yandex(&id, "Без цензуры") { return Some(audio); }
         }
-        for candidate in originals::online_candidates(t).unwrap_or_default() {
-            if let Ok((buf, format)) = originals::online_audio(&candidate) {
-                if let Ok(decoder) = open_decoder(&buf) {
-                    if let Some(audio) = check((buf, decoder, format)) { return Ok(audio); }
+        let candidates = originals::online_candidates(t).unwrap_or_default();
+        let next = candidates.first().and_then(|candidate| candidate.next.clone());
+        let mut try_external = |candidates: Vec<originals::OnlineCandidate>| {
+            for candidate in candidates {
+                if let Ok((buf, format)) = originals::online_audio(&candidate) {
+                    if let Ok(decoder) = open_decoder(&buf) {
+                        if let Some(audio) = check((buf, decoder, format)) { return Some(audio); }
+                    }
                 }
             }
+            None
+        };
+        if let Some(audio) = try_external(candidates) { return Some(audio); }
+        if let Some(next) = next {
+            if let Some(audio) = try_external(originals::online_next(&next).unwrap_or_default()) { return Some(audio); }
         }
     }
-    original.map_or_else(|| load_audio(api, &t.id), Ok)
+    None
 }
 
 fn load_audio(api: &Api, track_id: &str) -> Res<Audio> {
@@ -1258,6 +1267,31 @@ impl Engine {
                     }
                 }
             }
+            Msg::Replacement { gen, credential, audio } => {
+                if gen != self.gen || !self.loaded || self.fading.is_some() || credential != crate::resolver_login::credential()
+                    || !crate::api::allow_explicit() { return; }
+                if let Some((buf, decoder, format)) = audio {
+                    let position = self.pos();
+                    let paused = self.paused;
+                    let src = self.source(decoder, Duration::ZERO);
+                    let success = if let Some(sink) = self.sink() {
+                        sink.pause();
+                        sink.clear();
+                        sink.append(src);
+                        let ok = sink.try_seek(Duration::from_secs_f32(position)).is_ok();
+                        if !paused { sink.play(); }
+                        ok
+                    } else { false };
+                    if success {
+                        self.current_buf = Some(buf);
+                        self.sh().format = format;
+                        (self.notify)();
+                    } else {
+                        if let Some(sink) = self.sink() { sink.clear(); }
+                        let _ = self.restore_at(position);
+                    }
+                }
+            }
             Msg::Prefetch { gen, id, res } => {
                 if gen != self.prefetch_gen || self.prefetching.as_deref() != Some(id.as_str()) {
                     return;
@@ -1920,6 +1954,17 @@ impl Engine {
         }
         self.publish_soon();
         self.prefetch_next();
+        if crate::api::allow_explicit() {
+            if let (Some(api), Some(buf)) = (self.api.clone(), self.current_buf.clone()) {
+                let gen = self.gen;
+                let tx = self.tx.clone();
+                let credential = crate::resolver_login::credential();
+                thread::spawn(move || {
+                    let audio = resolve_track(&api, &t, buf);
+                    let _ = tx.send(Msg::Replacement { gen, credential, audio });
+                });
+            }
+        }
     }
 
     fn publish_soon(&mut self) {
@@ -2129,20 +2174,6 @@ mod tests {
         let dec = Decoder::new(Cursor::new(bytes)).expect("decode");
         let samples = dec.take(44100).count();
         assert!(samples > 1000);
-    }
-
-    #[test]
-    #[ignore = "requires a Yandex account and its originals.json"]
-    fn personal_stream_and_decode() {
-        let token = std::env::var("YM_TOKEN").expect("YM_TOKEN");
-        let catalog_id = std::env::var("ANCENSOR_TEST_TRACK").expect("ANCENSOR_TEST_TRACK");
-        let api = Api::new(&token);
-        let track = api.tracks(std::slice::from_ref(&catalog_id)).expect("catalog lookup").remove(0);
-        assert_eq!(track.id, catalog_id);
-        let (_, decoder, format) = load_track(&api, &track).expect("stream and decode personal upload");
-        let expected = std::env::var("ANCENSOR_TEST_SOURCE").unwrap_or_else(|_| "Личная версия".into());
-        assert!(format.ends_with(&format!(" · {expected}")), "unexpected playback source: {format}");
-        assert!(decoder.take(44100).count() > 1000);
     }
 
     #[test]

@@ -1040,39 +1040,6 @@ impl Api {
         })
     }
 
-    pub fn account_uid(&self) -> Res<String> {
-        match self.account_uid.get() {
-            Some(uid) => Ok(uid.clone()),
-            None => self.account().map(|account| account.uid),
-        }
-    }
-
-    /// Only the account owner's explicitly named private playlist is a replacement source.
-    pub(crate) fn original_playlist_entries(&self) -> Res<Vec<Value>> {
-        let uid = self.account_uid()?;
-        let user = format!("/users/{uid}/playlists");
-        let timeout = Duration::from_secs(6);
-        let playlists = self.send(self.req(Method::GET, &format!("{user}/list")).timeout(timeout))?;
-        let mut named = playlists.as_array().into_iter().flatten().filter(|item| {
-            item["title"].as_str() == Some("YM UNCENSORED")
-                && item["visibility"].as_str() == Some("private")
-        });
-        let Some(playlist) = named.next() else { return Ok(Vec::new()) };
-        if named.next().is_some() { return Err("найдено несколько приватных плейлистов YM UNCENSORED".into()) }
-        let kind = str_of(playlist, "kind");
-        if kind.is_empty() || !kind.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err("Яндекс вернул неверный ID плейлиста".into());
-        }
-        let request = self.req(Method::GET, &format!("{user}/{kind}"))
-            .query(&[("rich-tracks", "true")])
-            .timeout(timeout);
-        let result = self.send(request)?;
-        if result["visibility"].as_str() != Some("private") || str_of(&result, "uid") != uid {
-            return Ok(Vec::new());
-        }
-        Ok(result["tracks"].as_array().cloned().unwrap_or_default())
-    }
-
     /// Имя для показа и ссылка на аватар 100×100.
     pub fn about(&self) -> Res<(String, Option<String>)> {
         let v = self.get("/account/about", &[])?;

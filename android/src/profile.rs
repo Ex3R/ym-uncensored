@@ -18,6 +18,18 @@ thread_local! {
     static RELEASE_PAGE: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
+pub(crate) fn connect_sources(ui: &App) {
+    let weak = ui.as_weak();
+    crate::resolver_login::connect(move |result| {
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.global::<Prof>().set_sources_connected(result.is_ok());
+                crate::toast(result.err().unwrap_or_else(|| "Внешние источники подключены".into()));
+            }
+        });
+    });
+}
+
 /// Картинки тем из APK оригинала.
 pub fn load_pictures(ui: &App) {
     let Some(mut apk) = original::Apk::open_density_split() else {
@@ -159,13 +171,7 @@ pub fn bind(ui: &App, player: &Player) {
                 crate::resolver_login::disconnect();
                 if let Some(ui) = settings_ui.upgrade() { ui.global::<Prof>().set_sources_connected(false); }
             } else {
-                let weak = settings_ui.clone();
-                crate::resolver_login::connect(move |result| {
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = weak.upgrade() { ui.global::<Prof>().set_sources_connected(result.is_ok()); }
-                        crate::toast(result.err().unwrap_or_else(|| "Внешние источники подключены".into()));
-                    });
-                });
+                if let Some(ui) = settings_ui.upgrade() { connect_sources(&ui); }
             }
             return;
         }

@@ -57,11 +57,6 @@ pub fn save_track(api: &Api, dir: &std::path::Path, t: &Track, flac: bool) -> Re
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let stem = track_file_stem(t);
     let part = dir.join(format!("{stem}.part"));
-    let upload = crate::originals::mapped_upload(api, t).or_else(|| {
-        let matches = crate::originals::playlist_candidates(api, t);
-        let first = *matches.first()?;
-        matches.iter().all(|id| *id == first).then_some(first)
-    });
     let mut last = String::new();
     for attempt in 0..3 {
         if attempt > 0 {
@@ -77,13 +72,7 @@ pub fn save_track(api: &Api, dir: &std::path::Path, t: &Track, flac: bool) -> Re
             }
             api.stream_url(&t.id).map(|(url, _)| url)
         };
-        let personal = upload.and_then(|id| {
-            api.stream_url(id).and_then(|(url, _)| api.download_to(&url, &part)).ok().filter(|size| *size > 0)
-        });
-        let downloaded = match personal {
-            Some(size) => Ok(size),
-            None => url().and_then(|url| api.download_to(&url, &part)),
-        };
+        let downloaded = url().and_then(|url| api.download_to(&url, &part));
         match downloaded {
             Ok(n) if n > 0 => {
                 last.clear();
