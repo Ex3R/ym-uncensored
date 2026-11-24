@@ -63,6 +63,7 @@ pub fn bind(ui: &App, player: &Player) {
     if c.check_updates {
         check_updates(ui);
     }
+    schedule_update_check(ui);
 
     let weak = ui.as_weak();
     let pl = player.clone();
@@ -88,6 +89,10 @@ pub fn bind(ui: &App, player: &Player) {
         api::ADD_TO_END.store(c.add_to_end, Relaxed);
         if p.get_updates() && !c.check_updates {
             check_updates(&ui);
+        }
+        if !p.get_updates() {
+            p.set_update("".into());
+            RELEASE_PAGE.with(|r| r.borrow_mut().clear());
         }
         c.check_updates = p.get_updates();
         c.save();
@@ -222,13 +227,26 @@ fn apply_theme(ui: &App) {
     ui.global::<T>().set_dark(dark);
 }
 
+fn schedule_update_check(ui: &App) {
+    let weak = ui.as_weak();
+    slint::Timer::single_shot(update::POLL, move || {
+        if let Some(ui) = weak.upgrade() {
+            if ui.global::<Prof>().get_updates() {
+                check_updates(&ui);
+            }
+            schedule_update_check(&ui);
+        }
+    });
+}
+
 fn check_updates(ui: &App) {
     let weak = ui.as_weak();
     std::thread::spawn(move || match update::check() {
         Ok(Some(r)) => {
             let _ = slint::invoke_from_event_loop(move || {
-                RELEASE_PAGE.with(|p| *p.borrow_mut() = r.page);
                 if let Some(ui) = weak.upgrade() {
+                    if !ui.global::<Prof>().get_updates() { return; }
+                    RELEASE_PAGE.with(|p| *p.borrow_mut() = r.page);
                     ui.global::<Prof>().set_update(r.version.into());
                 }
             });

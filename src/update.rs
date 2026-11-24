@@ -26,7 +26,7 @@ pub static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 
 /// Страница GitHub со всеми изменениями между запущенной версией и новой.
 pub fn changes_url(version: &str) -> String {
-    format!("{}/compare/v{}...v{version}", env!("CARGO_PKG_REPOSITORY"), env!("CARGO_PKG_VERSION"))
+    format!("{}/compare/v{}...v{version}", env!("CARGO_PKG_REPOSITORY"), split_version(env!("CARGO_PKG_VERSION")).0)
 }
 
 /// Аргумент, с которым обновлённый exe ждёт, пока закроется старый.
@@ -99,15 +99,12 @@ fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
     Some((it.next()?.ok()?, it.next()?.ok()?, it.next().unwrap_or(Ok(0)).ok()?))
 }
 
-fn release_page(v: &serde_json::Value, prefer_apk: bool) -> String {
-    let apk = v
-        .get("assets")
-        .and_then(|a| a.as_array())
-        .filter(|_| prefer_apk)
-        .and_then(|assets| assets.iter().find(|a| a.get("name").and_then(|n| n.as_str()) == Some(APK)))
+fn release_page(v: &serde_json::Value, package: Option<&str>) -> String {
+    let download = package
+        .and_then(|name| v.get("assets")?.as_array()?.iter().find(|a| a.get("name").and_then(|n| n.as_str()) == Some(name)))
         .and_then(|a| a.get("browser_download_url")?.as_str());
     // Внешний адрес может открыть браузер системы, поэтому разрешаем только HTTPS.
-    apk
+    download
         .and_then(crate::client::browser_url)
         .or_else(|| crate::client::browser_url(v.get("html_url")?.as_str()?))
         .unwrap_or_else(|| env!("CARGO_PKG_REPOSITORY").to_string())
@@ -132,7 +129,15 @@ pub fn check() -> Result<Option<Release>, String> {
     if latest <= current {
         return Ok(None);
     }
-    // На Linux обновляемся со страницы релиза: пакет ставит система.
+    let package = if cfg!(target_os = "android") {
+        Some(APK)
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) && std::env::var_os("APPIMAGE").is_some() {
+        Some("yamusic-rs-x86_64.AppImage")
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) && std::env::var_os("APPIMAGE").is_some() {
+        Some("yamusic-rs-aarch64.AppImage")
+    } else {
+        None
+    };
     #[cfg(any(windows, target_os = "macos"))]
     let assets = v.get("assets").and_then(|a| a.as_array());
     #[cfg(windows)]
@@ -141,7 +146,7 @@ pub fn check() -> Result<Option<Release>, String> {
     let dmg = assets.and_then(|assets| find_asset(assets, |n| n.starts_with("ym-uncensored-") && n.ends_with("-macos.dmg")));
     Ok(Some(Release {
         version: tag.trim_start_matches('v').to_string(),
-        page: release_page(&v, cfg!(target_os = "android")),
+        page: release_page(&v, package),
         #[cfg(windows)]
         exe,
         #[cfg(target_os = "macos")]
@@ -280,14 +285,14 @@ mod tests {
                 {"name": "yamusic-rs-arm64-v8a.apk", "browser_download_url": apk},
             ]
         });
-        assert_eq!(release_page(&release, false), page);
-        assert_eq!(release_page(&release, true), apk);
+        assert_eq!(release_page(&release, None), page);
+        assert_eq!(release_page(&release, Some(APK)), apk);
         release["assets"][1]["browser_download_url"] = serde_json::json!("http://example.com/test.apk");
-        assert_eq!(release_page(&release, true), page);
+        assert_eq!(release_page(&release, Some(APK)), page);
         release["assets"] = serde_json::json!([]);
-        assert_eq!(release_page(&release, true), page);
+        assert_eq!(release_page(&release, Some(APK)), page);
         release["html_url"] = serde_json::json!(null);
-        assert_eq!(release_page(&release, true), env!("CARGO_PKG_REPOSITORY"));
+        assert_eq!(release_page(&release, Some(APK)), env!("CARGO_PKG_REPOSITORY"));
     }
 
     #[cfg(windows)]

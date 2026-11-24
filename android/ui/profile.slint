@@ -581,6 +581,22 @@ component SettingsPage inherits Screen {
         Section { text: "Помощь и обратная связь"; }
         SetRow {
             icons: root.icons;
+            title: "Проверять обновления";
+            kind: 1;
+            on: Prof.updates;
+            clicked => {
+                Prof.updates = !Prof.updates;
+                Prof.changed();
+            }
+        }
+        if Prof.update != "": SetRow {
+            icons: root.icons;
+            title: "Обновить";
+            text: "Доступна версия " + Prof.update;
+            clicked => { Prof.link("update"); }
+        }
+        SetRow {
+            icons: root.icons;
             title: "О приложении";
             text: Prof.update != "" ? "Доступна версия " + Prof.update : "Версия " + Prof.version;
             clicked => { Prof.about-open = true; }

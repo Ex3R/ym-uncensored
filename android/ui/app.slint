@@ -713,6 +713,30 @@ export component App inherits Window {
         height: root.height;
     }
 
+    property <string> dismissed-update;
+    if Prof.update != "" && root.dismissed-update != Prof.update: Rectangle {
+        x: 12px;
+        y: 40px;
+        width: root.width - 24px;
+        height: 48px;
+        border-radius: 14px;
+        background: #333336;
+        HorizontalLayout {
+            padding-left: 12px;
+            Text { text: "Версия " + Prof.update; color: #fff; vertical-alignment: center; overflow: elide; }
+            Rectangle {
+                width: 100px;
+                Text { text: "Обновить"; color: #ffdf41; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { Prof.link("update"); } }
+            }
+            Rectangle {
+                width: 44px;
+                Text { text: "×"; font-size: 20px; color: #fff; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.dismissed-update = Prof.update; } }
+            }
+        }
+    }
+
     if Now.toast != "": Rectangle {
         x: (root.width - self.width) / 2;
         y: root.height - self.height - (player.open ? 40px : root.page-bottom);

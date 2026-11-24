@@ -51,6 +51,8 @@ pub struct Config {
     /// Блоки главной и «Книг и подкастов», которые скрыл пользователь.
     pub hidden_blocks: Vec<HiddenBlock>,
     /// Раз в полчаса спрашивать GitHub о новой версии.
+    // Older builds stored false unconditionally and had no user-facing switch.
+    #[serde(rename = "notify_updates")]
     pub check_updates: bool,
     /// «Треки 18+» в меню профиля.
     pub allow_explicit: bool,
@@ -101,7 +103,7 @@ impl Default for Config {
             download_flac: false,
             log_volume: false,
             hidden_blocks: Vec::new(),
-            check_updates: false,
+            check_updates: true,
             allow_explicit: true,
             add_to_end: false,
             wave_motion: false,
@@ -268,6 +270,15 @@ pub fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::plaintext_fallback;
+
+    #[test]
+    fn update_notifications_migrate_and_remember_opt_out() {
+        let old: super::Config = serde_json::from_str(r#"{"check_updates":false}"#).unwrap();
+        assert!(old.check_updates);
+        let disabled = super::Config { check_updates: false, ..old };
+        let saved = serde_json::to_string(&disabled).unwrap();
+        assert!(!serde_json::from_str::<super::Config>(&saved).unwrap().check_updates);
+    }
 
     fn some(v: &str) -> Option<String> {
         Some(v.to_string())

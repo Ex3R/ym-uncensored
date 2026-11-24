@@ -1498,19 +1498,23 @@ thread_local! {
 }
 
 /// Проверка обновлений в фоне (первая — через 10 с после запуска) и кнопка «Обновить» в тосте.
+static UPDATE_WORKER: std::sync::OnceLock<std::thread::Thread> = std::sync::OnceLock::new();
+
 fn start_updates(ui: &AppWindow) {
     let weak = ui.as_weak();
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(10));
+        let _ = UPDATE_WORKER.set(std::thread::current());
+        std::thread::park_timeout(Duration::from_secs(10));
         loop {
             if !crate::update::ENABLED.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_secs(60));
+                std::thread::park();
                 continue;
             }
             match crate::update::check() {
                 Ok(Some(r)) => {
                     let weak = weak.clone();
                     let _ = slint::invoke_from_event_loop(move || {
+                        if !crate::update::ENABLED.load(Ordering::Relaxed) { return; }
                         if let Some(ui) = weak.upgrade() {
                             ui.global::<App>().set_update_version(r.version.clone().into());
                             UPDATE.with(|u| *u.borrow_mut() = Some(r));
@@ -1520,7 +1524,7 @@ fn start_updates(ui: &AppWindow) {
                 Ok(None) => {}
                 Err(e) => log(format!("обновления: {e}")),
             }
-            std::thread::sleep(crate::update::POLL);
+            std::thread::park_timeout(crate::update::POLL);
         }
     });
     ui.global::<App>().on_update_changes(|| {
@@ -3253,6 +3257,7 @@ impl Ctx {
                 let on = !app.get_check_updates();
                 app.set_check_updates(on);
                 crate::update::ENABLED.store(on, Ordering::Relaxed);
+                if let Some(worker) = UPDATE_WORKER.get() { worker.unpark(); }
                 if !on {
                     app.set_update_version(SharedString::new());
                     UPDATE.with(|u| *u.borrow_mut() = None);
