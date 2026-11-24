@@ -55,6 +55,7 @@ pub struct Track {
     /// Ревизия и серверная позиция строки, выбранной пользователем.
     playlist_slot: Option<Box<PlaylistSlot>>,
     pub id: String,
+    pub user_upload: bool,
     pub album_id: Option<String>,
     pub title: String,
     /// «Hardtekk», «Remix» — официальное приложение пишет её серым после названия.
@@ -376,6 +377,8 @@ pub(crate) fn parse_track(v: &Value) -> Option<Track> {
     Some(Track {
         playlist_slot: None,
         id,
+        user_upload: v.get("trackSource").and_then(Value::as_str).is_some_and(|s| s.eq_ignore_ascii_case("UGC"))
+            || v.get("ugcArtistName").is_some_and(|name| !name.is_null()),
         album_id: album.and_then(|a| s(a.get("id"))),
         title,
         version,

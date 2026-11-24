@@ -140,8 +140,9 @@ enum Msg {
     Likes(String, Res<Vec<String>>),
     LikeFinished { uid: String, id: String, liked: bool, result: Res<()> },
     Batch { res: Res<Batch>, replace: bool, gen: u64 },
-    Audio { gen: u64, res: Res<Audio> },
-    Prefetch { gen: u64, id: String, res: Res<Audio> },
+    Audio { gen: u64, res: Res<LoadedTrack> },
+    Prefetch { gen: u64, id: String, res: Res<LoadedTrack> },
+    KnownFinished { owner: std::sync::Weak<()>, revision: u64, audio: Option<Audio> },
     Replacement { job: std::sync::Weak<()>, audio: Option<Audio> },
     Resume { gen: u64, res: Res<Option<Resume>> },
     Error(String),
@@ -304,6 +305,26 @@ fn round3(x: f64) -> f64 {
 /// Скачиваемый трек, его декодер и формат («MP3 320»).
 type Audio = (Arc<Buf>, Decoder<Reader>, String);
 
+struct LoadedTrack {
+    baseline: Audio,
+    known: KnownStatus,
+}
+
+enum KnownStatus {
+    Miss,
+    Pending(u64),
+    Verified(u64, Audio),
+}
+
+impl KnownStatus {
+    fn revision(&self) -> Option<u64> {
+        match self {
+            Self::Pending(revision) | Self::Verified(revision, _) => Some(*revision),
+            Self::Miss => None,
+        }
+    }
+}
+
 struct ReplacementCheck {
     id: String,
     revision: u64,
@@ -372,8 +393,78 @@ const YNISON_EVERY: Duration = Duration::from_secs(60);
 /// Сколько позиция может стоять на месте у играющего скачанного трека.
 const STALL_LIMIT: Duration = Duration::from_secs(3);
 
-fn load_track(api: &Api, t: &Track) -> Res<Audio> {
-    load_audio(api, &t.id)
+// Once the catalog decoder is ready, allow a cold TLS lookup, then a separate delivery
+// window only for an actual match. Misses and errors wake the download worker immediately.
+const LOOKUP_GRACE: Duration = Duration::from_secs(2);
+const FIRST_BUFFER_WAIT: Duration = Duration::from_secs(7);
+
+enum KnownEvent {
+    Found,
+    Verified(Audio),
+}
+
+fn initial_status(events: &Receiver<KnownEvent>, revision: u64, wait: Duration) -> KnownStatus {
+    let mut timeout = wait.min(LOOKUP_GRACE);
+    loop {
+        match events.recv_timeout(timeout) {
+            Ok(KnownEvent::Verified(audio)) => return KnownStatus::Verified(revision, audio),
+            Ok(KnownEvent::Found) => timeout = wait,
+            Err(RecvTimeoutError::Disconnected) => return KnownStatus::Miss,
+            Err(RecvTimeoutError::Timeout) => return KnownStatus::Pending(revision),
+        }
+    }
+}
+
+fn load_for_playback(
+    api: Api, track: Track, owner: std::sync::Weak<()>, tx: Sender<Msg>,
+    deliver: impl FnOnce(Res<LoadedTrack>),
+) {
+    let revision = crate::resolver_login::session_revision();
+    let (give_baseline, baseline) = mpsc::channel::<Arc<Buf>>();
+    let (result, known) = mpsc::channel::<KnownEvent>();
+    let metadata = crate::api::allow_explicit().then(|| crate::originals::public_metadata(&track)).flatten();
+    if let Some(metadata) = metadata {
+        let id = track.id.clone();
+        let job = owner.clone();
+        thread::spawn(move || {
+            let current = || job.strong_count() != 0 && crate::api::allow_explicit()
+                && crate::resolver_login::session_revision() == revision;
+            if !current() { return; }
+            let Some(token) = crate::resolver_login::credential() else { return };
+            if !current() { return; }
+            let Some(hit) = crate::originals::known_candidate(&id, metadata, &token) else { return };
+            if !current() || result.send(KnownEvent::Found).is_err() { return; }
+            let Some(media) = crate::originals::known_audio(&hit, &id, token, &current) else { return };
+            let Ok(buf) = baseline.recv() else { return };
+            let limit = Instant::now() + Duration::from_secs(48);
+            while current() && !buf.done() && Instant::now() < limit {
+                buf.complete_before(Instant::now() + Duration::from_millis(200));
+            }
+            if !current() || !buf.complete_before(Instant::now()) { return; }
+            let Ok(digest) = crate::originals::media_digest(buf.reader()) else { return };
+            if !hit.matches(&id, &digest) { return; }
+            let Ok(decoder) = open_decoder(&media.buf) else { return };
+            if current() && result.send(KnownEvent::Verified((media.buf.clone(), decoder, media.format.clone()))).is_ok() {
+                crate::originals::cache_known(&hit, &id, &media);
+            }
+        });
+    } else {
+        drop(result);
+    }
+    let baseline = match load_audio(&api, &track.id) {
+        Ok(audio) => audio,
+        Err(error) => return deliver(Err(error)),
+    };
+    let _ = give_baseline.send(baseline.0.clone());
+    let status = initial_status(&known, revision, FIRST_BUFFER_WAIT);
+    let pending = matches!(status, KnownStatus::Pending(_));
+    deliver(Ok(LoadedTrack { baseline, known: status }));
+    if pending {
+        let audio = known.into_iter().find_map(|event| match event {
+            KnownEvent::Verified(audio) => Some(audio), KnownEvent::Found => None,
+        });
+        let _ = tx.send(Msg::KnownFinished { owner, revision, audio });
+    }
 }
 
 fn resolve_track(
@@ -431,13 +522,15 @@ fn resolve_track(
         let try_external = |candidates: Vec<originals::OnlineCandidate>| {
             for candidate in candidates {
                 if !current() { return None; }
-                if let Ok(result) = originals::online_audio(&candidate,&t.id,original_digest())
+                if let Ok(result) = originals::online_audio(&candidate,&t.id,original_digest(),current)
                     .inspect_err(|_| { retry.set(true); log("Замена: ошибка загрузки аудио"); }) {
                     if let Ok(decoder) = open_decoder(&result.buf) {
                         let audio = (result.buf.clone(),decoder,result.format.clone());
                         if !current() { return None; }
                         if result.cached {
                             log(format!("Замена {}: подтверждённое аудио из кэша",t.id));
+                            // Migrate a previously verified, baseline-bound v0.2.2 cache hit.
+                            originals::remember_external(result, &candidate, &t.id, original_digest());
                             return Some(audio);
                         }
                         if let Some(audio) = check(audio) {
@@ -616,7 +709,11 @@ struct Engine {
     loudness: Loudness,
     repeat: Repeat,
     shuffle: bool,
-    prefetch: Option<(String, Audio)>,
+    prefetch: Option<(String, LoadedTrack)>,
+    current_load: Option<Arc<()>>,
+    paused_start: Option<LoadedTrack>,
+    prefetch_load: Option<Arc<()>>,
+    load_started: Instant,
     prefetching: Option<String>,
     prefetch_failure: Option<(String, Instant)>,
     prefetch_gen: u64,
@@ -704,6 +801,10 @@ impl Engine {
             repeat: Repeat::Off,
             shuffle: false,
             prefetch: None,
+            current_load: None,
+            paused_start: None,
+            prefetch_load: None,
+            load_started: Instant::now(),
             prefetching: None,
             prefetch_failure: None,
             prefetch_gen: 0,
@@ -1103,6 +1204,8 @@ impl Engine {
     }
 
     fn stop_audio(&mut self) {
+        self.current_load = None;
+        self.paused_start = None;
         if let Some(s) = self.sink() {
             s.clear();
         }
@@ -1117,6 +1220,7 @@ impl Engine {
         self.queue.clear();
         self.prefetch = None;
         self.prefetching = None;
+        self.prefetch_load = None;
         self.prefetch_failure = None;
         self.prefetch_gen = self.prefetch_gen.wrapping_add(1);
         self.fetching = false;
@@ -1174,6 +1278,17 @@ impl Engine {
     // ---------- главный цикл ----------
 
     fn tick(&mut self) {
+        if let Some(id) = &self.prefetching {
+            let wanted = self.queue.front().is_some_and(|t| t.id == *id)
+                || (!self.loaded && self.current.as_ref().is_some_and(|t| t.id == *id));
+            if !wanted {
+                self.prefetch_load = None;
+                self.prefetching = None;
+                self.prefetch_gen = self.prefetch_gen.wrapping_add(1);
+            }
+        } else if self.prefetch.is_none() {
+            self.prefetch_load = None;
+        }
         self.check_replacement();
         #[cfg(windows)]
         self.check_output();
@@ -1326,6 +1441,29 @@ impl Engine {
                     match res {
                         Ok(b) => self.play_loaded(b),
                         Err(e) => self.on_load_error(e),
+                    }
+                }
+            }
+            Msg::KnownFinished { owner, revision, audio } => {
+                let authorized = revision == crate::resolver_login::session_revision() && crate::api::allow_explicit();
+                if self.current_load.as_ref().is_some_and(|job| owner.ptr_eq(&Arc::downgrade(job))) {
+                    if let Some(mut loaded) = self.paused_start.take() {
+                        loaded.known = audio.filter(|_| authorized).map_or(KnownStatus::Miss, |a| KnownStatus::Verified(revision, a));
+                        self.play_loaded(loaded);
+                        return;
+                    }
+                    if !authorized { return; }
+                    if let Some(check) = self.current_check.as_mut().filter(|c| owner.ptr_eq(&Arc::downgrade(&c.owner))) {
+                        if audio.is_some() {
+                            check.finished = true;
+                            check.audio = audio;
+                        } else {
+                            self.current_check = None; // Let the regular background verification run.
+                        }
+                    }
+                } else if authorized && self.prefetch_load.as_ref().is_some_and(|job| owner.ptr_eq(&Arc::downgrade(job))) {
+                    if let Some((_, loaded)) = &mut self.prefetch {
+                        loaded.known = audio.map_or(KnownStatus::Miss, |a| KnownStatus::Verified(revision, a));
                     }
                 }
             }
@@ -1764,6 +1902,7 @@ impl Engine {
         }
         self.prefetch = None;
         self.prefetching = None;
+        self.prefetch_load = None;
         self.prefetch_failure = None;
         self.prefetch_gen = self.prefetch_gen.wrapping_add(1);
         self.next_check = None;
@@ -1813,6 +1952,11 @@ impl Engine {
     fn resume(&mut self) {
         self.paused = false;
         self.publish_soon();
+        if let Some(loaded) = self.paused_start.take() {
+            // Both bounded waits have already elapsed. A user's Play must work immediately.
+            self.play_loaded(loaded);
+            return;
+        }
         if let Some(pos) = self.held_pos.filter(|_| self.loaded && self.audio.is_none()) {
             if !self.restore_at(pos) {
                 self.paused = true;
@@ -1906,6 +2050,9 @@ impl Engine {
     // ---------- загрузка ----------
 
     fn start_current(&mut self) {
+        self.current_load = None;
+        self.paused_start = None;
+        self.load_started = Instant::now();
         self.gen += 1;
         self.loaded = false;
         self.listen = None;
@@ -1929,23 +2076,27 @@ impl Engine {
         }
         if self.prefetch.as_ref().map(|(id, _)| *id == t.id).unwrap_or(false) {
             let (_, b) = self.prefetch.take().unwrap();
+            self.current_load = self.prefetch_load.take();
             self.play_loaded(b);
             return;
         }
         if self.prefetching.as_deref() == Some(t.id.as_str()) {
+            self.current_load = self.prefetch_load.take();
             return;
         }
         self.start_download();
     }
 
     fn start_download(&mut self) {
+        self.paused_start = None;
         let (Some(api), Some(t)) = (self.api.clone(), self.current.clone()) else { return };
         let gen = self.gen;
         let tx = self.tx.clone();
-        thread::spawn(move || {
-            let res = load_track(&api, &t);
+        let owner = self.current_load.insert(Arc::new(()));
+        let job = Arc::downgrade(owner);
+        thread::spawn(move || load_for_playback(api, t, job, tx.clone(), |res| {
             let _ = tx.send(Msg::Audio { gen, res });
-        });
+        }));
     }
 
     fn prefetch_next(&mut self) {
@@ -1962,17 +2113,39 @@ impl Engine {
         self.prefetching = Some(next.id.clone());
         let gen = self.prefetch_gen;
         let tx = self.tx.clone();
-        thread::spawn(move || {
-            let res = load_track(&api, &next);
-            let _ = tx.send(Msg::Prefetch { gen, id: next.id, res });
-        });
+        let owner = self.prefetch_load.insert(Arc::new(()));
+        let job = Arc::downgrade(owner);
+        let id = next.id.clone();
+        thread::spawn(move || load_for_playback(api, next, job, tx.clone(), |res| {
+            let _ = tx.send(Msg::Prefetch { gen, id, res });
+        }));
     }
 
-    fn play_loaded(&mut self, baseline: Audio) {
+    fn initial_audio(&mut self, track: &Track, loaded: LoadedTrack) -> (Audio, &'static str) {
+        if let Some(prepared) = self.take_current_replacement() { return (prepared, "prefetch"); }
+        let revision = crate::resolver_login::session_revision();
+        if crate::api::allow_explicit() && loaded.known.revision() == Some(revision) {
+            if let Some(owner) = &self.current_load {
+                let finished = matches!(loaded.known, KnownStatus::Verified(..));
+                self.current_check = Some(ReplacementCheck {
+                    id: track.id.clone(), revision, owner: owner.clone(), finished, audio: None,
+                });
+                if let KnownStatus::Verified(_, audio) = loaded.known { return (audio, "known"); }
+            }
+        }
+        (loaded.baseline, "catalog")
+    }
+
+    fn play_loaded(&mut self, loaded: LoadedTrack) {
         let Some(t) = self.current.clone() else { return };
-        let prepared = self.take_current_replacement();
-        if prepared.is_some() { log(format!("Замена {}: готова до начала трека", t.id)); }
-        let (buf, src, format) = prepared.unwrap_or(baseline);
+        if self.paused && matches!(loaded.known, KnownStatus::Pending(rev) if rev == crate::resolver_login::session_revision())
+            && crate::api::allow_explicit() && self.current_load.is_some() {
+            // A restored track may spend minutes paused. Keep the fallback ready for Play
+            // and let the proven alternative be the first decoder actually queued.
+            self.paused_start = Some(loaded);
+            return;
+        }
+        let ((buf, src, format), origin) = self.initial_audio(&t, loaded);
         if !self.ensure_audio() {
             self.error("Не найдено аудиоустройство");
             self.sh().loading = false;
@@ -1982,15 +2155,17 @@ impl Engine {
         let src = self.source(src, fade_in);
         let vol = self.gain();
         let paused = self.paused;
+        let resume_position = self.resume_at.take().filter(|(id, pos)| *id == t.id && *pos > 1.0);
         if let Some(sink) = self.sink() {
             sink.clear();
+            sink.pause();
             sink.set_volume(vol);
             sink.append(src);
-            if paused {
-                sink.pause()
-            } else {
-                sink.play()
+            if let Some((_, pos)) = resume_position {
+                if let Err(e) = sink.try_seek(Duration::from_secs_f32(pos)) { log(format!("seek: {e:?}")); }
             }
+            log(format!("Первый буфер {}: {origin}, {format}, {} мс", t.id, self.load_started.elapsed().as_millis()));
+            if !paused { sink.play(); }
         }
         self.current_buf = Some(buf);
         self.sh().format = format;
@@ -2002,11 +2177,7 @@ impl Engine {
             l.go();
         }
         self.remember_wave(&t);
-        if let Some((id, pos)) = self.resume_at.take() {
-            if id == t.id && pos > 1.0 {
-                self.cmd(Cmd::Seek(pos));
-            }
-        }
+        if let Some(listen) = self.listen.as_mut().filter(|_| resume_position.is_some()) { listen.seek = true; }
         self.publish_soon();
         self.prefetch_next();
     }
@@ -2019,10 +2190,11 @@ impl Engine {
     }
 
     fn check_replacement(&mut self) {
-        if !self.loaded || self.paused || !crate::api::allow_explicit() { return; }
+        if !self.loaded || !crate::api::allow_explicit() { return; }
         let revision = crate::resolver_login::session_revision();
         let Some(track) = self.current.as_ref() else { return };
         if !self.current_check.as_ref().is_some_and(|c| c.matches(track, revision)) {
+            if self.paused { return; }
             let Some(buf) = self.current_buf.clone() else { return };
             self.next_check = None;
             self.current_check = self.schedule_check(track.clone(), buf, revision);
@@ -2042,6 +2214,9 @@ impl Engine {
                     ok
                 } else { false };
                 if success {
+                    if let Some(track) = &self.current {
+                        log(format!("Замена буфера {}: {format}, {:.2} с", track.id, position));
+                    }
                     self.current_buf = Some(buf);
                     self.sh().format = format;
                     (self.notify)();
@@ -2051,6 +2226,7 @@ impl Engine {
                 }
             }
         }
+        if self.paused { return; }
         // The playing track gets the verification worker first. Prepare only the head of the wave.
         let next = self.queue.front().filter(|_| self.list.is_none() && self.source.station().is_some());
         if self.next_check.as_ref().is_some_and(|c| next.is_none_or(|t| !c.matches(t, revision))) {
@@ -2058,8 +2234,8 @@ impl Engine {
         }
         if self.next_check.is_some() || !self.current_check.as_ref().is_some_and(|c| c.finished) { return; }
         let (Some(next), Some((id, baseline))) = (next, &self.prefetch) else { return };
-        if next.id == *id {
-            self.next_check = self.schedule_check(next.clone(), baseline.0.clone(), revision);
+        if next.id == *id && baseline.known.revision() != Some(revision) {
+            self.next_check = self.schedule_check(next.clone(), baseline.baseline.0.clone(), revision);
         }
     }
 
@@ -2312,7 +2488,7 @@ mod tests {
         let api = Api::new(&std::env::var("YM_TOKEN").expect("local catalog credential"));
         for id in std::env::var("YM_TEST_TRACK_IDS").unwrap().split(',') {
             let t = api.tracks(&[id.to_owned()]).unwrap().pop().unwrap();
-            let (buf, baseline, _) = load_track(&api, &t).unwrap();
+            let (buf, baseline, _) = load_audio(&api, &t.id).unwrap();
             let retry = std::cell::Cell::new(false);
             if std::env::var_os("YM_TEST_OFFLINE_SOURCES").is_some() {
                 assert!(resolve_track(&api,&t,buf.clone(),&|| true,&retry).is_none());
@@ -2331,21 +2507,115 @@ mod tests {
         }
     }
 
+    fn make_audio(format: &str) -> Audio {
+        // Three silent MPEG-1 Layer III frames, 128 kbps, 44.1 kHz.
+        let mut frame = vec![0; 417];
+        frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0]);
+        let bytes = frame.repeat(3);
+        let response = tungstenite::http::Response::builder()
+            .header("content-length", bytes.len()).body(bytes).unwrap();
+        let buf = Buf::from_media(response.into(), &|| true).unwrap();
+        let decoder = open_decoder(&buf).unwrap();
+        (buf, decoder, format.to_owned())
+    }
+
+    #[test]
+    fn first_decoder_uses_verified_audio_and_keeps_catalog_after_session_change() {
+        let _guard = super::EXPLICIT_TEST_LOCK.lock().unwrap();
+        let track = crate::api::parse_track(&serde_json::json!({"id":7, "title":"Track"})).unwrap();
+        let revision = crate::resolver_login::session_revision();
+        let mut engine = Engine::new(mpsc::channel().0, Default::default(), Default::default(), Arc::new(|| {}), Default::default());
+        engine.current = Some(track.clone());
+        engine.current_load = Some(Arc::new(()));
+        for (issued, expected) in [(revision, "known"), (revision.wrapping_add(1), "catalog")] {
+            let alternative = make_audio("provider");
+            let baseline = make_audio("catalog");
+            let expected_buf = if expected == "known" { alternative.0.clone() } else { baseline.0.clone() };
+            let loaded = LoadedTrack { baseline, known: KnownStatus::Verified(issued, alternative) };
+            let ((buf, mut decoder, _), origin) = engine.initial_audio(&track, loaded);
+            assert_eq!(origin, expected);
+            assert!(Arc::ptr_eq(&buf, &expected_buf));
+            assert!(decoder.next().is_some());
+        }
+    }
+
+    #[test]
+    fn restored_pause_holds_baseline_until_known_finishes_or_the_user_plays() {
+        let _guard = super::EXPLICIT_TEST_LOCK.lock().unwrap();
+        let track = crate::api::parse_track(&serde_json::json!({"id":7, "title":"Track"})).unwrap();
+        let mut engine = Engine::new(mpsc::channel().0, Default::default(), Default::default(), Arc::new(|| {}), Default::default());
+        engine.current = Some(track.clone());
+        engine.current_load = Some(Arc::new(()));
+        let revision = crate::resolver_login::session_revision();
+        engine.resume_at = Some((track.id, 12.0));
+        engine.play_loaded(LoadedTrack { baseline: make_audio("catalog"), known: KnownStatus::Pending(revision) });
+        assert!(engine.paused_start.is_some());
+        assert!(!engine.loaded);
+        assert!(engine.audio.is_none());
+        let stale = Arc::new(());
+        engine.handle(Msg::KnownFinished { owner: Arc::downgrade(&stale), revision, audio: Some(make_audio("stale")) });
+        assert!(engine.paused_start.is_some());
+        assert_eq!(engine.resume_at.as_ref().map(|p| p.1), Some(12.0));
+        engine.stop_audio();
+        assert!(engine.paused_start.is_none());
+    }
+
+    #[test]
+    fn late_known_audio_skips_asr_but_cannot_replace_a_different_track() {
+        let _guard = super::EXPLICIT_TEST_LOCK.lock().unwrap();
+        let track = crate::api::parse_track(&serde_json::json!({"id":7, "title":"Track"})).unwrap();
+        let revision = crate::resolver_login::session_revision();
+        let mut engine = Engine::new(mpsc::channel().0, Default::default(), Default::default(), Arc::new(|| {}), Default::default());
+        engine.current = Some(track.clone());
+        let owner = Arc::downgrade(engine.current_load.insert(Arc::new(())));
+        let (events, pending) = mpsc::channel();
+        events.send(KnownEvent::Found).unwrap();
+        let known = initial_status(&pending, revision, Duration::from_millis(5));
+        assert!(matches!(known, KnownStatus::Pending(_)));
+        let loaded = LoadedTrack { baseline: make_audio("baseline"), known };
+        assert_eq!(engine.initial_audio(&track, loaded).1, "catalog");
+        assert!(!engine.current_check.as_ref().unwrap().finished);
+        let stale = Arc::new(());
+        engine.handle(Msg::KnownFinished { owner: Arc::downgrade(&stale), revision, audio: Some(make_audio("stale")) });
+        assert!(engine.take_current_replacement().is_none());
+        engine.handle(Msg::KnownFinished { owner, revision, audio: Some(make_audio("provider")) });
+        assert!(engine.current_check.as_ref().unwrap().finished);
+        assert_eq!(engine.take_current_replacement().unwrap().2, "provider");
+    }
+
+    #[test]
+    #[ignore = "requires a dedicated signed-in test profile and approved server pair"]
+    fn live_first_buffer() {
+        let profile = std::env::var_os("YM_TEST_PROFILE").expect("use an isolated profile");
+        assert_eq!(crate::config::dir(), std::path::PathBuf::from(profile));
+        assert!(crate::resolver_login::credential().is_some());
+        let api = Api::new(&std::env::var("YM_TOKEN").expect("local catalog credential"));
+        let expected = std::env::var("YM_TEST_FIRST_SOURCE").expect("known or catalog");
+        for id in std::env::var("YM_TEST_TRACK_IDS").unwrap().split(',') {
+            let track = api.tracks(&[id.to_owned()]).unwrap().pop().unwrap();
+            let (tx, rx) = mpsc::channel();
+            let mut engine = Engine::new(tx.clone(), Default::default(), Default::default(), Arc::new(|| {}), Default::default());
+            engine.current = Some(track.clone());
+            let owner = Arc::downgrade(engine.current_load.insert(Arc::new(())));
+            let started = Instant::now();
+            let (catalog, t) = (api.clone(), track.clone());
+            thread::spawn(move || load_for_playback(catalog, t, owner, tx.clone(), |res| {
+                let _ = tx.send(Msg::Audio { gen: 0, res });
+            }));
+            let Msg::Audio { res, .. } = rx.recv_timeout(Duration::from_secs(60)).unwrap() else { panic!("missing first buffer") };
+            let ((buf, decoder, format), origin) = engine.initial_audio(&track, res.unwrap());
+            let elapsed = started.elapsed().as_millis();
+            // The decoder is exactly the one returned to play_loaded for the first sink.append.
+            assert!(decoder.take(6 * 96000).any(|sample| sample.unsigned_abs() > 32));
+            eprintln!("first buffer {id} {origin} {format}, {elapsed}ms, encoded {}", crate::originals::media_digest(buf.reader()).unwrap());
+            assert_eq!(origin, expected, "first decoder for {id}");
+        }
+    }
+
     #[test]
     fn wave_promotes_only_the_matching_check_and_consumes_ready_audio_once() {
         let _guard = super::EXPLICIT_TEST_LOCK.lock().unwrap();
         let track = |id| crate::api::parse_track(&serde_json::json!({"id":id,"title":"Track"})).unwrap();
-        let make_audio = |format: &str| {
-            // Three silent MPEG-1 Layer III frames, 128 kbps, 44.1 kHz.
-            let mut frame = vec![0; 417];
-            frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0]);
-            let bytes = frame.repeat(3);
-            let response = tungstenite::http::Response::builder()
-                .header("content-length", bytes.len()).body(bytes).unwrap();
-            let buf = Buf::from_media(response.into()).unwrap();
-            let decoder = open_decoder(&buf).unwrap();
-            (buf, decoder, format.to_owned())
-        };
         let mut e = Engine::new(mpsc::channel().0, Default::default(), Default::default(), Arc::new(|| {}), Default::default());
         // Drive completions ourselves, without network requests or an audio device.
         let (wakeup, _rx) = mpsc::sync_channel(1);
@@ -2356,7 +2626,7 @@ mod tests {
         e.paused = false;
         e.current_buf = Some(make_audio("current").0);
         e.queue.push_back(track(2));
-        e.prefetch = Some(("2".into(), make_audio("baseline")));
+        e.prefetch = Some(("2".into(), LoadedTrack { baseline: make_audio("baseline"), known: KnownStatus::Miss }));
         e.check_replacement();
         assert!(e.next_check.is_none());
         let active = Arc::downgrade(&e.current_check.as_ref().unwrap().owner);
@@ -2364,7 +2634,7 @@ mod tests {
         e.check_replacement();
         let discarded = Arc::downgrade(&e.next_check.as_ref().unwrap().owner);
         e.queue.push_front(track(3));
-        e.prefetch = Some(("3".into(), make_audio("baseline")));
+        e.prefetch = Some(("3".into(), LoadedTrack { baseline: make_audio("baseline"), known: KnownStatus::Miss }));
         e.check_replacement();
         e.handle(Msg::Replacement { job: discarded, audio: Some(make_audio("stale")) });
         assert!(!e.next_check.as_ref().unwrap().finished);

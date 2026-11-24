@@ -96,7 +96,8 @@ pub fn verified(api: &Api, original: &crate::verification::Recording, candidate:
 }
 
 fn can_match(track: &Track) -> bool {
-    track.duration_ms > 0 && !track.id.is_empty() && track.id.bytes().all(|byte| byte.is_ascii_digit())
+    !track.user_upload && track.duration_ms > 0 && (1..=20).contains(&track.id.len())
+        && !track.id.starts_with('0') && track.id.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 pub fn should_uncensor(
@@ -194,32 +195,90 @@ pub struct OnlineCandidate {
     pub next: Option<String>,
 }
 
-pub fn online_candidates(track: &Track) -> Res<Vec<OnlineCandidate>> {
-    use std::io::Read;
-    let Some(token) = resolver_login::credential() else { return Ok(vec![]) };
+impl OnlineCandidate {
+    fn valid(&self) -> bool {
+        self.ticket.len() == 32 && self.ticket.bytes().all(|b| b.is_ascii_hexdigit())
+            && matches!(self.source.as_str(), "Bandcamp" | "SoundCloud" | "YouTube Music" | "Audius")
+    }
+}
+
+fn digest_valid(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn pair_digest(track: &str, baseline: &str, media: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(format!("ym-pair-v1\n{track}\n{baseline}\n{media}").as_bytes()))
+}
+
+pub fn public_metadata(track: &Track) -> Option<serde_json::Value> {
+    if !can_match(track) || track.title.trim().is_empty() || track.artist_list.is_empty() { return None; }
     let lower = normalized(&track.title);
     let (base, _) = title_variant(&lower);
     let version = normalized(&track.version);
     let title = if version.is_empty() || variant(&version).is_some() { base.to_owned() } else { format!("{base} ({version})") };
     let artists: Vec<_> = track.artist_list.iter().map(|a| &a.name).collect();
-    let response = resolver_login::signed("POST", "/search", &token, serde_json::to_vec(&serde_json::json!({"title":title,"artists":artists,"duration_ms":track.duration_ms})).map_err(|e|e.to_string())?)?
-        .timeout(Duration::from_secs(24))
+    Some(serde_json::json!({"title":title,"artists":artists,"duration_ms":track.duration_ms}))
+}
+
+fn request_json<T: serde::de::DeserializeOwned>(path: &str, token: &str, body: serde_json::Value, timeout: Duration) -> Res<T> {
+    use std::io::Read;
+    let body = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+    let response = resolver_login::signed("POST", path, token, body)?.timeout(timeout)
         .send().and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
-    let candidates: Vec<OnlineCandidate> = serde_json::from_reader(response.take(16 * 1024)).map_err(|e| e.to_string())?;
-    Ok(candidates.into_iter().filter(|c| c.ticket.len() == 32 && c.ticket.bytes().all(|b| b.is_ascii_hexdigit())
-        && matches!(c.source.as_str(), "Bandcamp" | "SoundCloud" | "YouTube Music" | "Audius")).take(12).collect())
+    serde_json::from_reader(response.take(16 * 1024)).map_err(|e| e.to_string())
+}
+
+fn candidates(path: &str, metadata: serde_json::Value) -> Res<Vec<OnlineCandidate>> {
+    let Some(token) = resolver_login::credential() else { return Ok(vec![]) };
+    let hits: Vec<OnlineCandidate> = request_json(path, &token, metadata, Duration::from_secs(24))?;
+    Ok(hits.into_iter().filter(OnlineCandidate::valid).take(12).collect())
+}
+
+pub fn online_candidates(track: &Track) -> Res<Vec<OnlineCandidate>> {
+    let Some(metadata) = public_metadata(track) else { return Ok(vec![]) };
+    candidates("/search", metadata)
 }
 
 pub fn online_next(next: &str) -> Res<Vec<OnlineCandidate>> {
-    use std::io::Read;
-    if next.len()!=32 || !next.bytes().all(|b|b.is_ascii_hexdigit()) { return Ok(vec![]); }
-    let token = resolver_login::credential().ok_or("Внешние источники отключены")?;
-    let body = serde_json::to_vec(&serde_json::json!({"next":next})).map_err(|e|e.to_string())?;
-    let response = resolver_login::signed("POST", "/next", &token, body)?.timeout(Duration::from_secs(24))
-        .send().and_then(|r|r.error_for_status()).map_err(|e|e.to_string())?;
-    let candidates: Vec<OnlineCandidate> = serde_json::from_reader(response.take(16*1024)).map_err(|e|e.to_string())?;
-    Ok(candidates.into_iter().filter(|c|c.ticket.len()==32 && c.ticket.bytes().all(|b|b.is_ascii_hexdigit())
-        && matches!(c.source.as_str(),"Bandcamp"|"SoundCloud"|"YouTube Music"|"Audius")).take(12).collect())
+    if next.len() != 32 || !next.bytes().all(|b| b.is_ascii_hexdigit()) { return Ok(vec![]); }
+    candidates("/next", serde_json::json!({"next":next}))
+}
+
+#[derive(Deserialize)]
+pub struct KnownCandidate {
+    #[serde(flatten)]
+    candidate: OnlineCandidate,
+    baseline_sha256: Option<String>,
+    pair_sha256: Option<String>,
+    #[serde(default)]
+    baseline_sha256s: Vec<String>,
+}
+
+impl KnownCandidate {
+    fn cache_key(&self, track: &str) -> Option<String> {
+        let media = self.candidate.sha256.as_deref().filter(|s| digest_valid(s))?;
+        if self.baseline_sha256s.len() > 16 || self.baseline_sha256s.iter().any(|s| !digest_valid(s) || s == media) { return None; }
+        match (&self.baseline_sha256, &self.pair_sha256) {
+            (Some(baseline), None) if digest_valid(baseline) && baseline != media => Some(pair_digest(track, baseline, media)),
+            (None, Some(pair)) if digest_valid(pair) && self.baseline_sha256s.is_empty() => Some(pair.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn matches(&self, track: &str, baseline: &str) -> bool {
+        let Some(media) = self.candidate.sha256.as_deref() else { return false };
+        if !digest_valid(baseline) || media == baseline || self.cache_key(track).is_none() { return false; }
+        if let Some(pair) = &self.pair_sha256 { return *pair == pair_digest(track, baseline, media); }
+        self.baseline_sha256.as_deref() == Some(baseline) || self.baseline_sha256s.iter().any(|s| s == baseline)
+    }
+}
+
+pub fn known_candidate(track: &str, mut metadata: serde_json::Value, token: &str) -> Option<KnownCandidate> {
+    metadata["catalog_id"] = track.into();
+    let hits: Vec<KnownCandidate> = request_json("/known", token, metadata, Duration::from_secs(4)).ok()?;
+    let [hit]: [KnownCandidate; 1] = hits.try_into().ok()?;
+    (hit.candidate.valid() && hit.cache_key(track).is_some()).then_some(hit)
 }
 
 pub struct ExternalAudio {
@@ -229,35 +288,76 @@ pub struct ExternalAudio {
     token: String,
 }
 
-pub fn online_audio(candidate: &OnlineCandidate, track: &str, original: Option<&str>) -> Res<ExternalAudio> {
-    let token = resolver_login::credential().ok_or("Сначала подключите внешние источники")?;
-    let mut request = resolver_login::signed("GET", &format!("/audio/{}",candidate.ticket), &token, vec![])?;
-    let cached = original.zip(candidate.sha256.as_deref()).and_then(|(original, expected)| {
-        if expected.len()!=64 || !expected.bytes().all(|c| c.is_ascii_hexdigit()) { return None; }
-        confirmed_audio::read(&confirmed_audio::path(&token,track,original,expected),expected)
-    });
+fn fetch_audio(candidate: &OnlineCandidate, token: String, cached: Option<std::sync::Arc<crate::stream::Buf>>, timeout: Duration, current: &impl Fn() -> bool) -> Res<ExternalAudio> {
+    if !current() { return Err("Выбор трека изменился".into()); }
+    let mut request = resolver_login::signed("GET", &format!("/audio/{}", candidate.ticket), &token, vec![])?;
     if cached.is_some() {
-        request = request.header("If-None-Match",format!("\"{}\"",candidate.sha256.as_deref().unwrap_or_default()));
+        request = request.header("If-None-Match", format!("\"{}\"", candidate.sha256.as_deref().unwrap_or_default()));
     }
-    let response = request.timeout(Duration::from_secs(48)).send().map_err(|e| e.to_string())?;
+    let response = request.timeout(timeout).send().map_err(|e| e.to_string())?;
     let reused = response.status() == reqwest::StatusCode::NOT_MODIFIED;
-    let buf = if reused {
-        cached.ok_or("Нет подтверждённой копии")?
-    } else {
-        let response = response.error_for_status().map_err(|e| e.to_string())?;
-        crate::stream::Buf::from_media(response).map_err(|e| e.to_string())?
-    };
-    Ok(ExternalAudio { buf, format: format!("MP3 · {}",candidate.source), cached: reused,token })
+    let buf = ticket_audio(response, candidate.sha256.as_deref(), cached, current)?;
+    Ok(ExternalAudio { buf, format: format!("MP3 · {}", candidate.source), cached: reused, token })
+}
+
+fn ticket_audio(response: reqwest::blocking::Response, expected: Option<&str>, cached: Option<std::sync::Arc<crate::stream::Buf>>, current: &impl Fn() -> bool) -> Res<std::sync::Arc<crate::stream::Buf>> {
+    match response.status() {
+        reqwest::StatusCode::NOT_MODIFIED => cached.ok_or_else(|| "Нет подтверждённой копии".into()),
+        reqwest::StatusCode::OK => {
+            let buf = crate::stream::Buf::from_media(response, current).map_err(|e| e.to_string())?;
+            if let Some(expected) = expected {
+                if !digest_valid(expected) || confirmed_audio::digest(buf.reader()).ok().as_deref() != Some(expected) {
+                    return Err("Аудио отличается от выданного сервером".into());
+                }
+            }
+            Ok(buf)
+        }
+        status => Err(format!("Сервер аудио вернул {status}")),
+    }
+}
+
+fn cached_audio(token: &str, track: &str, media: &str, pair: &str, legacy_baseline: Option<&str>) -> Option<std::sync::Arc<crate::stream::Buf>> {
+    let read = |key| confirmed_audio::read(&confirmed_audio::path(token, track, key, media), media);
+    read(pair).or_else(|| legacy_baseline.and_then(read))
+}
+
+pub fn known_audio(hit: &KnownCandidate, track: &str, token: String, current: &impl Fn() -> bool) -> Option<ExternalAudio> {
+    let media = hit.candidate.sha256.as_deref()?;
+    let pair = hit.cache_key(track)?;
+    let cached = cached_audio(&token, track, media, &pair, hit.baseline_sha256.as_deref()).or_else(|| {
+        hit.baseline_sha256s.iter().find_map(|s| cached_audio(&token, track, media, &pair_digest(track, s, media), Some(s)))
+    });
+    fetch_audio(&hit.candidate, token, cached, Duration::from_secs(15), current).ok()
+}
+
+pub fn cache_known(hit: &KnownCandidate, track: &str, audio: &ExternalAudio) {
+    if audio.cached { return; }
+    if let (Some(pair), Some(media)) = (hit.cache_key(track), &hit.candidate.sha256) {
+        let _ = confirmed_audio::store(&confirmed_audio::path(&audio.token, track, &pair, media), &audio.buf);
+    }
+}
+
+pub fn online_audio(candidate: &OnlineCandidate, track: &str, original: Option<&str>, current: &impl Fn() -> bool) -> Res<ExternalAudio> {
+    let token = resolver_login::credential().ok_or("Сначала подключите внешние источники")?;
+    let cached = original.zip(candidate.sha256.as_deref()).and_then(|(baseline, media)| {
+        if !digest_valid(media) { return None; }
+        cached_audio(&token, track, media, &pair_digest(track, baseline, media), Some(baseline))
+    });
+    fetch_audio(candidate, token, cached, Duration::from_secs(48), current)
 }
 
 pub fn remember_external(result: ExternalAudio, candidate: &OnlineCandidate, track: &str, original: Option<&str>) {
     let Ok(digest) = confirmed_audio::digest(result.buf.reader()) else { return };
+    let mut body = serde_json::json!({"ticket":candidate.ticket,"sha256":digest});
     if let Some(original) = original {
-        let _ = confirmed_audio::store(&confirmed_audio::path(&result.token,track,original,&digest), &result.buf);
+        let proof = pair_digest(track, original, &digest);
+        let path = confirmed_audio::path(&result.token, track, &proof, &digest);
+        if !result.cached || !path.exists() { let _ = confirmed_audio::store(&path, &result.buf); }
+        body["catalog_id"] = track.into();
+        body["pair_sha256"] = proof.into();
     }
-    let body = serde_json::json!({"ticket":candidate.ticket,"sha256":digest}).to_string().into_bytes();
     std::thread::spawn(move || {
-        if let Ok(request) = resolver_login::signed("POST","/confirm",&result.token,body) {
+        if let Ok(request) = resolver_login::signed("POST", "/confirm", &result.token, body.to_string().into_bytes()) {
             let _ = request.send();
         }
     });
@@ -265,6 +365,64 @@ pub fn remember_external(result: ExternalAudio, candidate: &OnlineCandidate, tra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_pairs_bind_both_files_and_personal_proofs_bind_the_catalog_id() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let c = "c".repeat(64);
+        let hit = |proof: serde_json::Value| {
+            let mut data = serde_json::json!({"source":"Bandcamp","ticket":"1".repeat(32),"sha256":b});
+            data.as_object_mut().unwrap().extend(proof.as_object().unwrap().clone());
+            serde_json::from_value::<KnownCandidate>(data).unwrap()
+        };
+        let operator = hit(serde_json::json!({"baseline_sha256":a,"baseline_sha256s":[c]}));
+        assert!(operator.matches("7", &a));
+        assert!(operator.matches("7", &c));
+        assert!(!operator.matches("7", &b));
+        assert!(!operator.matches("7", &"d".repeat(64)));
+        let commitment = pair_digest("7", &a, &b);
+        let personal = hit(serde_json::json!({"pair_sha256":commitment}));
+        assert!(personal.matches("7", &a));
+        assert!(!personal.matches("8", &a));
+        assert!(!personal.matches("7", &c));
+        assert!(!hit(serde_json::json!({"baseline_sha256":a,"pair_sha256":commitment})).matches("7", &a));
+        assert!(!hit(serde_json::json!({"baseline_sha256s":[a],"pair_sha256":commitment})).matches("7", &a));
+    }
+
+    #[test]
+    fn ticket_response_requires_matching_bytes_or_a_previously_hashed_copy() {
+        let response = |status, bytes: &[u8]| tungstenite::http::Response::builder()
+            .status(status).header("content-length", bytes.len()).body(bytes.to_vec()).unwrap().into();
+        let hash = media_digest(b"expected".as_slice()).unwrap();
+        assert!(ticket_audio(response(200, b"tampered"), Some(&hash), None, &|| true).is_err());
+        assert!(ticket_audio(response(304, b""), Some(&hash), None, &|| true).is_err());
+        let buf = ticket_audio(response(200, b"expected"), Some(&hash), None, &|| true).unwrap();
+        assert!(ticket_audio(response(403, b""), Some(&hash), Some(buf.clone()), &|| true).is_err());
+        let cached = ticket_audio(response(304, b""), Some(&hash), Some(buf.clone()), &|| true).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&buf, &cached));
+    }
+
+    #[test]
+    fn legacy_verified_media_is_bound_to_both_recordings_and_its_session() {
+        let path = confirmed_audio::path("session", "7", "baseline A", "media A");
+        assert_ne!(path, confirmed_audio::path("session", "7", "baseline B", "media A"));
+        assert_ne!(path, confirmed_audio::path("session", "7", "baseline A", "media B"));
+        assert_ne!(path, confirmed_audio::path("other session", "7", "baseline A", "media A"));
+        assert_ne!(path, confirmed_audio::path("session", "8", "baseline A", "media A"));
+    }
+
+    #[test]
+    fn only_public_catalog_tracks_produce_request_metadata() {
+        let mut input = serde_json::json!({"id":42,"title":"Track", "artists":[{"id":1,"name":"Artist"}],"durationMs":1000});
+        let metadata = |value: &serde_json::Value| public_metadata(&crate::api::parse_track(value).unwrap());
+        assert_eq!(metadata(&input).unwrap(), serde_json::json!({"artists":["Artist"],"title":"track","duration_ms":1000}));
+        input["id"] = "a-private-recording".into();
+        assert!(metadata(&input).is_none());
+        input["id"] = 42.into();
+        input["trackSource"] = "UGC".into();
+        assert!(metadata(&input).is_none());
+    }
 
     #[test]
     fn title_or_confirmed_vocals_enable_search_and_foreign_vocals_stay_excluded() {
