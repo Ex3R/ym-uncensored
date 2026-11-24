@@ -35,15 +35,22 @@ impl Buf {
         Ok(Buf { file: temp_file()?, state: Mutex::default(), cv: Condvar::new() })
     }
 
-    pub fn from_media(response: Response) -> io::Result<Arc<Buf>> {
+    pub fn from_media(response: Response, current: &impl Fn() -> bool) -> io::Result<Arc<Buf>> {
         const LIMIT: u64 = 32 * 1024 * 1024;
         let len = response.content_length().filter(|n| (1..=LIMIT).contains(n))
             .ok_or_else(|| io::Error::other("invalid audio size"))?;
         let mut file = temp_file()?;
-        if io::copy(&mut response.take(len + 1), &mut file)? != len {
-            return Err(io::Error::other("incomplete audio"));
+        let mut source = response.take(len + 1);
+        let mut chunk = [0; 32 * 1024];
+        let mut copied = 0;
+        while current() {
+            let n = source.read(&mut chunk)?;
+            if n == 0 && copied == len { return Ok(Self::from_complete_file(file, len)); }
+            if n == 0 || copied + n as u64 > len { return Err(io::Error::other("incomplete audio")); }
+            io::Write::write_all(&mut file, &chunk[..n])?;
+            copied += n as u64;
         }
-        Ok(Self::from_complete_file(file, len))
+        Err(io::Error::other("playback changed"))
     }
 
     pub fn from_complete_file(file: File, len: u64) -> Arc<Self> {
@@ -115,6 +122,13 @@ impl Buf {
     /// Загрузка закончилась, успешно или нет.
     pub fn done(&self) -> bool {
         self.state.lock().unwrap().done
+    }
+
+    /// Exact encoded-file proofs require the entire download before the startup deadline.
+    pub fn complete_before(&self, deadline: std::time::Instant) -> bool {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let (state, _) = self.cv.wait_timeout_while(self.state.lock().unwrap(), remaining, |s| !s.done).unwrap();
+        state.done && state.err.is_none() && state.len.is_none_or(|len| state.have == len)
     }
 
     /// Ждёт, пока придёт больше `pos` байтов или загрузка закончится.
