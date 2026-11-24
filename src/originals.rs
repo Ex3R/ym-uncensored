@@ -763,7 +763,27 @@ mod tests {
         let old = make("1", "a");
         let body = |status, declared, data: &[u8]| tungstenite::http::Response::builder().status(status)
             .header("content-length", declared).body(data.to_vec()).unwrap().into();
-        for first in [body(502,0,b""), body(503,0,b""), body(504,0,b""), body(200,8,b"cut")] {
+        // A Vec-backed reqwest fixture reports its actual byte length. Use HTTP to
+        // reproduce a connection that closes before the declared body is delivered.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let peer = std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut input = std::io::BufReader::new(&stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if input.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\ncut").unwrap();
+            stream.flush().unwrap();
+        });
+        let partial = reqwest::blocking::Client::builder().no_proxy().timeout(Duration::from_secs(2))
+            .build().unwrap().get(endpoint).send().unwrap();
+        peer.join().unwrap();
+        for first in [body(502,0,b""), body(503,0,b""), body(504,0,b""), partial] {
             let mut first = Some(first);
             let mut issued = vec![];
             let buf = deliver_known(&old, &|| true, || Some(make("2", "a")), |ticket| {
@@ -779,7 +799,11 @@ mod tests {
                 ticket_audio(response.take().unwrap(), Some(&digest), None, &|| true)
             }).is_none());
         }
-        assert!(deliver_known(&old, &|| false, || panic!("cancelled owner"), |_| Err::<(),_>(AudioError::Transport)).is_none());
+        let active = std::cell::Cell::new(true);
+        assert!(deliver_known(&old, &|| active.get(), || panic!("cancelled owner"), |_| {
+            active.set(false);
+            Err::<(),_>(AudioError::Transport)
+        }).is_none());
         for replacement in [make("1", "a"), make("2", "b")] {
             let mut attempts = 0;
             assert!(deliver_known(&old, &|| true, || Some(replacement), |_| {
