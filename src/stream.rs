@@ -35,9 +35,14 @@ impl Buf {
         Ok(Buf { file: temp_file()?, state: Mutex::default(), cv: Condvar::new() })
     }
 
-    #[cfg(target_os = "macos")]
-    pub fn from_file(file: File) -> io::Result<Arc<Buf>> {
-        let len = file.metadata()?.len();
+    pub fn from_media(response: Response) -> io::Result<Arc<Buf>> {
+        const LIMIT: u64 = 32 * 1024 * 1024;
+        let len = response.content_length().filter(|n| (1..=LIMIT).contains(n))
+            .ok_or_else(|| io::Error::other("invalid audio size"))?;
+        let mut file = temp_file()?;
+        if io::copy(&mut response.take(len + 1), &mut file)? != len {
+            return Err(io::Error::other("incomplete audio"));
+        }
         Ok(Arc::new(Buf {
             file,
             state: Mutex::new(State { have: len, len: Some(len), done: true, err: None }),

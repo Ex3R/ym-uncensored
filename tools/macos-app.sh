@@ -79,16 +79,6 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 mkdir -p "$APP/Contents/Resources/licenses"
 cp models/*-LICENSE "$APP/Contents/Resources/licenses/"
 cp "$BIN" "$APP/Contents/MacOS/$EXE"
-install -m 644 tools/online-audio.py "$APP/Contents/Resources/online-audio.py"
-cat > "$APP/Contents/Resources/online-audio" <<'LAUNCHER'
-#!/bin/sh
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-runtime="${ANCENSOR_PYTHON:-$HOME/Library/Application Support/ancensor/online-audio-runtime/bin/python}"
-[ -x "$runtime" ] || runtime=python3
-exec "$runtime" "$(dirname "$0")/online-audio.py" "$@"
-LAUNCHER
-chmod 755 "$APP/Contents/Resources/online-audio"
-
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

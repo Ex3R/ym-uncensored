@@ -397,13 +397,10 @@ fn load_track(api: &Api, t: &Track) -> Res<Audio> {
         for id in originals::catalog_versions(api, t) {
             if let Some(audio) = try_yandex(&id, "Без цензуры") { return Ok(audio); }
         }
-        #[cfg(target_os = "macos")]
         for candidate in originals::online_candidates(t).unwrap_or_default() {
-            if let Ok(Some((file, format))) = originals::online_audio(t, &candidate) {
-                if let Ok(buf) = Buf::from_file(file) {
-                    if let Ok(decoder) = open_decoder(&buf) {
-                        if let Some(audio) = check((buf, decoder, format)) { return Ok(audio); }
-                    }
+            if let Ok((buf, format)) = originals::online_audio(&candidate) {
+                if let Ok(decoder) = open_decoder(&buf) {
+                    if let Some(audio) = check((buf, decoder, format)) { return Ok(audio); }
                 }
             }
         }

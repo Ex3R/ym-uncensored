@@ -267,71 +267,43 @@ fn recording_query(track: &Track) -> Option<String> {
     Some(format!("{title} {}", track.artists))
 }
 
-#[cfg(target_os = "macos")]
+const RESOLVER: &str = "https://ym.idkroma.ru/api/uncensored/v1";
+
 #[derive(Deserialize)]
 pub struct OnlineCandidate {
     source: String,
-    url: String,
+    ticket: String,
 }
 
-#[cfg(target_os = "macos")]
-fn resolver() -> Option<std::process::Command> {
-    use std::process::{Command, Stdio};
-    let exe = std::env::current_exe().ok()?;
-    let path = exe.parent()?.parent()?.join("Resources/online-audio");
-    if !path.is_file() { return None; }
-    let mut command = Command::new(path);
-    command.env_remove("YM_TOKEN").stdin(Stdio::null()).stderr(Stdio::null());
-    Some(command)
+fn resolver_http() -> Res<reqwest::blocking::Client> {
+    // Yandex account credentials belong only to the catalog client.
+    reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(4))
+        .redirect(reqwest::redirect::Policy::none())
+        .build().map_err(|e| e.to_string())
 }
 
-#[cfg(target_os = "macos")]
 pub fn online_candidates(track: &Track) -> Res<Vec<OnlineCandidate>> {
-    let Some(mut command) = resolver() else { return Ok(vec![]) };
-    let title = normalized(&track.title);
-    let (title, _) = title_variant(&title);
+    use std::io::Read;
+    let lower = normalized(&track.title);
+    let (base, _) = title_variant(&lower);
     let version = normalized(&track.version);
-    let title = if version.is_empty() || variant(&version).is_some() {
-        title.to_string()
-    } else {
-        format!("{title} ({version})")
-    };
-    let artists: Vec<_> = track.artist_list.iter().map(|a| a.name.as_str()).collect();
-    let artists = serde_json::to_string(&artists).map_err(|e| e.to_string())?;
-    let result = command.arg("--list").arg(title).arg(artists).arg(track.duration_ms.to_string())
-        .output().map_err(|e| e.to_string())?;
-    if !result.status.success() { return Ok(vec![]); }
-    serde_json::from_slice(&result.stdout).map_err(|e| e.to_string())
+    let title = if version.is_empty() || variant(&version).is_some() { base.to_owned() } else { format!("{base} ({version})") };
+    let artists: Vec<_> = track.artist_list.iter().map(|a| &a.name).collect();
+    let response = resolver_http()?.post(format!("{RESOLVER}/search"))
+        .timeout(Duration::from_secs(19))
+        .json(&serde_json::json!({"title":title, "artists":artists, "duration_ms":track.duration_ms}))
+        .send().and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
+    let candidates: Vec<OnlineCandidate> = serde_json::from_reader(response.take(16 * 1024)).map_err(|e| e.to_string())?;
+    Ok(candidates.into_iter().filter(|c| c.ticket.len() == 32 && c.ticket.bytes().all(|b| b.is_ascii_hexdigit())
+        && matches!(c.source.as_str(), "Bandcamp" | "SoundCloud" | "YouTube Music")).take(12).collect())
 }
 
-#[cfg(target_os = "macos")]
-pub fn online_audio(track: &Track, candidate: &OnlineCandidate) -> Res<Option<(std::fs::File, String)>> {
-    use std::os::unix::fs::DirBuilderExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    let Some(mut command) = resolver() else { return Ok(None) };
-    struct TempMedia(PathBuf);
-    impl Drop for TempMedia {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    let cache = crate::config::cache_dir().join("online-audio");
-    std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
-    let suffix = NEXT.fetch_add(1, Ordering::Relaxed);
-    let path = cache.join(format!("{}-{suffix}", std::process::id()));
-    std::fs::DirBuilder::new().mode(0o700).create(&path).map_err(|e| e.to_string())?;
-    let media = TempMedia(path);
-    let result = command.arg("--download").arg(&candidate.source).arg(&candidate.url)
-        .arg(track.duration_ms.to_string()).arg(&media.0).output().map_err(|e| e.to_string())?;
-    if !result.status.success() { return Ok(None); }
-    let report: Value = serde_json::from_slice(&result.stdout).map_err(|e| e.to_string())?;
-    let Some(name @ ("audio.m4a" | "audio.mp3")) = report["file"].as_str() else { return Ok(None) };
-    let Some(source @ ("Bandcamp" | "SoundCloud" | "YouTube Music")) = report["source"].as_str() else { return Ok(None) };
-    let media_format = if name == "audio.m4a" { "AAC" } else { "MP3" };
-    let file = std::fs::File::open(media.0.join(name)).map_err(|e| e.to_string())?;
-    Ok(Some((file, format!("{media_format} · {source}"))))
+pub fn online_audio(candidate: &OnlineCandidate) -> Res<(std::sync::Arc<crate::stream::Buf>, String)> {
+    let response = resolver_http()?.get(format!("{RESOLVER}/audio/{}", candidate.ticket))
+        .timeout(Duration::from_secs(48)).send().and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
+    let buf = crate::stream::Buf::from_media(response).map_err(|e| e.to_string())?;
+    Ok((buf, format!("MP3 · {}", candidate.source)))
 }
 
 #[cfg(test)]
