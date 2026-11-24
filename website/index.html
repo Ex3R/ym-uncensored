@@ -5,7 +5,7 @@
 <meta name="theme-color" content="#fafaf8">
 <meta name="description" content="YM UNCENSORED — неофициальный плеер Яндекс Музыки с автоматическим подбором версий без цензуры. Для macOS, Windows, Linux и Android.">
 <title>YM UNCENSORED</title>
-<link rel="icon" href="assets/icon.svg"><link rel="stylesheet" href="style.css"><script src="download.js" defer></script>
+<link rel="icon" href="assets/icon.svg"><link rel="stylesheet" href="style.css"><script src="download.js" defer></script><script src="compare.js" defer></script>
 </head>
 <body>
 <div class="page">
@@ -14,10 +14,17 @@
 <div class="hero"><div class="hero-copy"><h1>YM <br>Uncensored</h1>
 <p class="intro">Неофициальный плеер Яндекс Музыки. Подбирает версии русскоязычных треков без цензуры в «Моей волне», альбомах и плейлистах.</p>
 <a class="jump" href="#download">Выбрать платформу <span aria-hidden="true">↓</span></a>
-</div><figure class="preview">
-<div class="preview-screen"><img id="screen" src="assets/lyrics.webp" width="1022" height="552" alt="Экран плеера с обложкой альбома и синхронным текстом песни"></div>
-<figcaption><span>В плеере</span><div class="modes" aria-label="Вид плеера"><button type="button" data-view="lyrics" aria-pressed="true">Текст песни</button><button type="button" data-view="album" aria-pressed="false">Альбом</button></div></figcaption>
-</figure></div>
+</div><section class="compare" id="compare" aria-labelledby="song">
+<div class="track"><img src="assets/groupie/cover.webp" width="108" height="108" alt="Обложка альбома с треком «Групи»"><div><p class="demo-label">Сравнить звучание</p><h2 id="song">Групи</h2><p class="artists">Платина, OG Buda</p></div><a class="catalog" href="https://music.yandex.ru/album/40891024/track/148716913" target="_blank" rel="noopener noreferrer" aria-label="Открыть трек в Яндекс Музыке">↗</a></div>
+<div class="transport"><button class="listen" type="button" aria-label="Воспроизвести" aria-pressed="false"><span aria-hidden="true">▶</span></button>
+<div class="wave-wrap"><canvas id="wave" aria-hidden="true"></canvas><input type="range" id="timeline" aria-label="Позиция во фрагменте" min="0" max="60" step="0.1" value="0"></div>
+<output id="clock" for="timeline">0:00 / 1:00</output></div>
+<div class="ab"><p class="mix-tip">Переключай версии во время трека или смешивай их ползунком.</p><div class="mix-labels"><button type="button" data-mix="0" aria-pressed="true">С цензурой</button><button type="button" data-mix="100" aria-pressed="false">Без цензуры</button></div>
+<input id="mix" type="range" min="0" max="100" step="1" value="0" aria-label="Баланс между версиями">
+</div>
+<div class="moments"><span>Слышно разницу</span><button type="button" data-time="39.5">0:40</button><button type="button" data-time="46.5">0:47</button></div>
+<p class="ab-status" role="status" id="ab-status"></p>
+</section></div>
 <section id="download" aria-labelledby="downloads-title">
 <div class="section-head"><h2 id="downloads-title">Скачать плеер</h2><a class="release" href="https://github.com/Ex3R/ym-uncensored/releases/tag/v0.2.0">Версия 0.2.0 <span aria-hidden="true">↗</span></a></div>
 <ul>
@@ -27,6 +34,10 @@
 <li><div><strong>Linux</strong><small>AppImage</small></div><div class="variants"><a class="file" data-os="Linux x86_64" aria-label="Скачать AppImage для Linux x86_64" href="https://github.com/Ex3R/ym-uncensored/releases/download/v0.2.0/yamusic-rs-x86_64.AppImage">x86_64 <b aria-hidden="true">↓</b></a><a class="file" data-os="Linux ARM64" aria-label="Скачать AppImage для Linux ARM64" href="https://github.com/Ex3R/ym-uncensored/releases/download/v0.2.0/yamusic-rs-aarch64.AppImage">ARM64 <b aria-hidden="true">↓</b></a></div></li>
 </ul>
 </section>
+<details class="more-preview"><summary>Интерфейс плеера</summary><figure class="preview">
+<div class="preview-screen"><img id="screen" src="assets/lyrics.webp" width="1022" height="552" alt="Экран плеера с обложкой альбома и синхронным текстом песни"></div>
+<figcaption><span>В плеере</span><div class="modes" aria-label="Вид плеера"><button type="button" data-view="lyrics" aria-pressed="true">Текст песни</button><button type="button" data-view="album" aria-pressed="false">Альбом</button></div></figcaption>
+</figure></details>
 </main>
 <footer><a href="https://pay.cloudtips.ru/p/567e5376" target="_blank" rel="noopener noreferrer">Поддержать Ex3R <span aria-hidden="true">↗</span></a><a href="https://github.com/Ex3R/ym-uncensored/blob/main/LICENSE">GPL-3.0</a></footer>
 </div>

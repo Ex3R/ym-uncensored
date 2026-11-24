@@ -10,3 +10,6 @@ __pycache__/
 wave_state.json
 *.keystore
 *.mobileprovision
+
+# The website preview media is deployed separately from the GPL source.
+/website/assets/groupie/
