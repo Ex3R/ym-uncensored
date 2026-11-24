@@ -12,3 +12,14 @@ document.querySelectorAll(".file").forEach(link => {
   });
 });
 dialog.querySelectorAll("button").forEach(button => button.addEventListener("click", () => dialog.close()));
+
+const previews = {
+  lyrics: ["assets/lyrics.webp", "Экран плеера с обложкой альбома и синхронным текстом песни"],
+  album: ["assets/album.webp", "Альбом со списком треков и кнопкой воспроизведения"],
+};
+const screen = document.querySelector("#screen");
+const modes = document.querySelectorAll("[data-view]");
+modes.forEach(button => button.addEventListener("click", () => {
+  [screen.src, screen.alt] = previews[button.dataset.view];
+  modes.forEach(other => other.setAttribute("aria-pressed", String(other === button)));
+}));
