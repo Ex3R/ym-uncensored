@@ -213,7 +213,7 @@ fn shadow_hello(device_id: &str) -> Value {
             },
             "device": {
                 "capabilities": { "can_be_player": false, "can_be_remote_controller": false, "volume_granularity": 0 },
-                "info": { "device_id": device_id, "type": "WEB", "title": "Яндекс Музыка RS", "app_name": "Chrome" },
+                "info": { "device_id": device_id, "type": "WEB", "title": "YM UNCENSORED", "app_name": "Chrome" },
                 "volume_info": { "volume": 0 },
                 "is_shadow": true,
             },

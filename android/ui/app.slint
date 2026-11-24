@@ -1,5 +1,6 @@
 // Фон «Моей волны» рисует OpenGL под прозрачным окном.
 
+import { SourceSetup } from "../../ui/source-setup.slint";
 import { Icons, WheelCard, Row, ArtistCard, Now, Cover, T } from "common.slint";
 import { Player } from "player.slint";
 import { LoadingPulse } from "../../ui/loading-pulse.slint";
@@ -52,6 +53,7 @@ component TabIcon inherits Rectangle {
 }
 
 component LoginScreen inherits Rectangle {
+    in property <bool> external-requested;
     in property <string> code;
     in property <string> hint;
     in property <image> logo;
@@ -82,7 +84,8 @@ component LoginScreen inherits Rectangle {
             padding-left: 32px;
             padding-right: 32px;
             Text {
-                text: "Вход в Яндекс";
+                text: root.external-requested ? "Шаг 1 из 2 · вход в музыку" : "Вход в музыку";
+                wrap: word-wrap;
                 color: #fff;
                 font-size: 28px;
                 font-weight: 700;
@@ -160,6 +163,9 @@ export component App inherits Window {
 
     in property <Icons> icons;
     in property <bool> logged-in;
+    in property <bool> sources-setup-open;
+    in property <bool> sources-requested;
+    callback sources-choose(bool);
 
     property <bool> rail: root.width >= 600px && root.height >= 300px;
     property <bool> wide-wave: root.width >= 540px && root.width > root.height;
@@ -195,6 +201,7 @@ export component App inherits Window {
     if !root.logged-in: LoginScreen {
         width: root.width;
         height: root.height;
+        external-requested: root.sources-requested;
         code: root.login-code;
         hint: root.login-hint;
         logo: root.icons.logo;
@@ -754,6 +761,15 @@ export component App inherits Window {
         }
     }
 
+    if root.sources-setup-open: SourceSetup {
+        width: root.width;
+        height: root.height;
+        music-connected: root.logged-in;
+        background-color: T.bg;
+        ink: T.fg;
+        selected(enabled) => { root.sources-choose(enabled); }
+    }
+
     // «Назад» закрывает то, что открыто сверху; если ничего, Android сворачивает приложение.
     back := FocusScope {
         width: 0;
@@ -762,7 +778,9 @@ export component App inherits Window {
             if e.text != Key.Back {
                 return reject;
             }
-            if Prof.logout-open {
+            if root.sources-setup-open {
+                root.sources-choose(false);
+            } else if Prof.logout-open {
                 Prof.logout-open = false;
             } else if Prof.about-open {
                 Prof.about-open = false;

@@ -4560,6 +4560,7 @@ dependencies = [
  "md-5",
  "miniz_oxide 0.8.9",
  "reqwest",
+ "ring",
  "rodio",
  "serde",
  "serde_json",

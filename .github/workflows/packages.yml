@@ -58,6 +58,11 @@ jobs:
       - run: git rev-parse HEAD
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - shell: pwsh
+        run: |
+          python tools/android-speech-model.py "$env:RUNNER_TEMP"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "YM_WINDOWS_SPEECH_MODEL=$env:RUNNER_TEMP/ggml-small-q5_1.bin" >> $env:GITHUB_ENV
       - run: cargo build --release --locked
       - shell: pwsh
         run: |

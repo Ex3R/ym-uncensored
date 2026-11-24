@@ -56,6 +56,7 @@ pub struct Config {
     pub check_updates: bool,
     /// «Треки 18+» в меню профиля.
     pub allow_explicit: bool,
+    pub sources_setup: Option<bool>,
     /// Добавлять треки в конец плейлиста, а не в начало.
     pub add_to_end: bool,
     /// Пятно «Моей волны» движется. Выключено: анимация всё время тратит процессор.
@@ -105,6 +106,7 @@ impl Default for Config {
             hidden_blocks: Vec::new(),
             check_updates: true,
             allow_explicit: true,
+            sources_setup: None,
             add_to_end: false,
             wave_motion: false,
             crossfade_secs: 0,
@@ -118,11 +120,15 @@ impl Default for Config {
 
 /// Separate settings and account credentials for this application.
 pub fn dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("YM_TEST_PROFILE") { return path.into(); }
     crate::sys::config_base().join("ancensor")
 }
 
 /// Скачанные шрифты и значки. На Windows лежат рядом с настройками, на Linux — в ~/.cache.
 pub fn cache_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("YM_TEST_PROFILE") { return PathBuf::from(path).join("cache"); }
     #[cfg(windows)]
     return dir();
     #[cfg(not(windows))]

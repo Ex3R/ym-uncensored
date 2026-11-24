@@ -9,6 +9,14 @@ fn main() {
         slint_build::CompilerConfiguration::new().with_style("fluent".into()),
     )
     .unwrap();
+    println!("cargo:rustc-check-cfg=cfg(ym_windows_speech_model)");
+    println!("cargo:rerun-if-env-changed=YM_WINDOWS_SPEECH_MODEL");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        if let Some(path) = std::env::var_os("YM_WINDOWS_SPEECH_MODEL") {
+            println!("cargo:rerun-if-changed={}", std::path::Path::new(&path).display());
+            println!("cargo:rustc-cfg=ym_windows_speech_model");
+        }
+    }
     #[cfg(windows)]
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         resources::embed();

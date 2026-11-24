@@ -76,6 +76,8 @@ find android/java "$OUT/gen" -name '*.java' > "$OUT/sources.txt"
 "$BT/d8" --release --min-api "$API" --lib "$PLATFORM/android.jar" --output "$STAGE" $(find "$OUT/classes" -name '*.class')
 
 (cd "$STAGE" && zip -q -r ../unsigned.apk .)
+python3 tools/android-speech-model.py "$STAGE/assets"
+(cd "$STAGE" && zip -q -0 ../unsigned.apk assets/ggml-small-q5_1.bin)
 "$BT/zipalign" -P 16 -f 4 "$UNSIGNED" "$OUT/aligned.apk"
 
 if [ "${APK_UNSIGNED_ONLY:-0}" = "1" ]; then

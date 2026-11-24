@@ -54,6 +54,8 @@ Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force "$stage\lib\$Abi" | Out-Null
 New-Item -ItemType Directory -Force "$stage\assets\licenses" | Out-Null
 Copy-Item "$PSScriptRoot\..\models\*-LICENSE" "$stage\assets\licenses"
+& python "$here\..\tools\android-speech-model.py" "$stage\assets"
+if ($LASTEXITCODE -ne 0) { throw 'Failed to stage the Android speech model' }
 Copy-Item "$target\$triple\$buildProfile\libyamusic.so" "$stage\lib\$Abi\"
 # oboe собран с c++_shared: библиотеку надо положить рядом.
 Copy-Item "$llvm\sysroot\usr\lib\$triple\libc++_shared.so" "$stage\lib\$Abi\"
@@ -83,7 +85,8 @@ $zip = [System.IO.Compression.ZipFile]::Open($unsigned, 'Update')
 try {
     Get-ChildItem $stage -Recurse -File | ForEach-Object {
         $name = $_.FullName.Substring($stage.Length + 1).Replace('\', '/')
-        [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $_.FullName, $name) | Out-Null
+        $compression = if ($name -eq 'assets/ggml-small-q5_1.bin') { [System.IO.Compression.CompressionLevel]::NoCompression } else { [System.IO.Compression.CompressionLevel]::Optimal }
+        [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $_.FullName, $name, $compression) | Out-Null
     }
 } finally { $zip.Dispose() }
 

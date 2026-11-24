@@ -181,6 +181,9 @@ export global App {
     // Установщик скачивается.
     in property <bool> update-busy;
     in property <bool> sources-connected;
+    in property <bool> sources-setup-open;
+    in property <bool> sources-requested;
+    callback sources-choose(bool);
     callback update-install();
     // «Что изменилось»: сравнение запущенной и новой версии на GitHub.
     callback update-changes();
@@ -233,7 +236,6 @@ export global App {
     in property <bool> wave-context;
     // Формат играющего файла, как у мода PulseSync: «MP3 320».
     in property <string> track-format;
-    in property <bool> personal-version;
     in property <[WaveSettingGroup]> wave-settings;
     in-out property <bool> wave-settings-open;
     in property <[string]> artist-list;

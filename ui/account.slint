@@ -154,7 +154,7 @@ export component AccountMenu inherits Rectangle {
 
         IdRow { x: 8px; y: 144px; width: 296px; ink: ink; icon: Icons.id-account; text: T.t("Управление аккаунтом"); clicked => { root.act("account"); } }
         IdRow { x: 8px; y: 188px; width: 296px; ink: ink; icon: Icons.id-settings; text: T.t("Настройки"); clicked => { root.act("settings"); } }
-        IdRow { x: 8px; y: 232px; width: 296px; ink: ink; icon: Icons.id-support; text: T.t("Чат с поддержкой"); clicked => { root.act("support"); } }
+        IdRow { x: 8px; y: 232px; width: 296px; ink: ink; icon: Icons.id-support; text: T.t("Обратная связь"); clicked => { root.act("support"); } }
         IdRow {
             x: 8px;
             y: 276px;
@@ -502,6 +502,11 @@ export component SettingsPage inherits Rectangle {
                     + (App.version-upstream == "" ? "" : " · upstream " + App.version-upstream);
                 clicked => { App.setting("about"); }
             }
+            SettingItem {
+                title: T.t("Исходный код и лицензии");
+                desc: "GPL-3.0-only · yamusic-rs · Spolzer · M1kage-dev";
+                clicked => { App.setting("components"); }
+            }
         }
     }
 }
@@ -536,7 +541,7 @@ export component LoginScreen inherits Rectangle {
         }
         Rectangle { height: 32px; }
         Text {
-            text: "Вход через Яндекс ID";
+            text: App.sources-requested ? "Шаг 1 из 2 · вход в музыку" : "Вход в музыку";
             horizontal-alignment: center;
             font-family: "YS Music Headline";
             font-size: Theme.font-size-headline-xl;

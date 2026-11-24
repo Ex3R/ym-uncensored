@@ -1,5 +1,5 @@
 #!/bin/bash
-# Собирает «Яндекс Музыка RS.app» из релизной сборки: Info.plist, значок, ad-hoc подпись.
+# Собирает «YM UNCENSORED.app» из релизной сборки: Info.plist, значок, ad-hoc подпись.
 #
 #   tools/macos-app.sh                    # нативная сборка (arm64 на Apple Silicon)
 #   tools/macos-app.sh --universal        # arm64 + x86_64 одним бинарём (lipo)
@@ -76,6 +76,7 @@ fi
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+python3 tools/android-speech-model.py "$APP/Contents/Resources"
 mkdir -p "$APP/Contents/Resources/licenses"
 cp models/*-LICENSE "$APP/Contents/Resources/licenses/"
 cp "$BIN" "$APP/Contents/MacOS/$EXE"
@@ -97,7 +98,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSApplicationCategoryType</key><string>public.app-category.music</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSRequiresAquaSystemAppearance</key><false/>
-  <key>NSHumanReadableCopyright</key><string>GPL-3.0, неофициальный клиент</string>
+  <key>NSHumanReadableCopyright</key><string>© 2026 Spolzer and contributors; © 2026 Ex3R (YM UNCENSORED). GPL-3.0-only. https://ym.idkroma.ru</string>
 </dict>
 </plist>
 PLIST
@@ -203,7 +204,15 @@ if [ "$DMG_ON" -eq 1 ]; then
   cp -R "$APP" "$STAGE/"
   ln -s /Applications "$STAGE/Applications"
   rm -f "$DMG"
-  hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+  # Hosted macOS runners occasionally fail to attach a newly created disk image.
+  # Keep diagnostics visible and retry the same local packaging operation.
+  for attempt in 1 2 3; do
+    if hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG"; then
+      break
+    fi
+    if [ "$attempt" -eq 3 ]; then exit 1; fi
+    sleep 3
+  done
   rm -rf "$STAGE"
   hdiutil verify "$DMG" >/dev/null
   echo "$DMG"

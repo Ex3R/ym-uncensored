@@ -1040,39 +1040,6 @@ impl Api {
         })
     }
 
-    pub fn account_uid(&self) -> Res<String> {
-        match self.account_uid.get() {
-            Some(uid) => Ok(uid.clone()),
-            None => self.account().map(|account| account.uid),
-        }
-    }
-
-    /// Only the account owner's explicitly named private playlist is a replacement source.
-    pub(crate) fn original_playlist_entries(&self) -> Res<Vec<Value>> {
-        let uid = self.account_uid()?;
-        let user = format!("/users/{uid}/playlists");
-        let timeout = Duration::from_secs(6);
-        let playlists = self.send(self.req(Method::GET, &format!("{user}/list")).timeout(timeout))?;
-        let mut named = playlists.as_array().into_iter().flatten().filter(|item| {
-            item["title"].as_str() == Some("YM UNCENSORED")
-                && item["visibility"].as_str() == Some("private")
-        });
-        let Some(playlist) = named.next() else { return Ok(Vec::new()) };
-        if named.next().is_some() { return Err("найдено несколько приватных плейлистов YM UNCENSORED".into()) }
-        let kind = str_of(playlist, "kind");
-        if kind.is_empty() || !kind.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err("Яндекс вернул неверный ID плейлиста".into());
-        }
-        let request = self.req(Method::GET, &format!("{user}/{kind}"))
-            .query(&[("rich-tracks", "true")])
-            .timeout(timeout);
-        let result = self.send(request)?;
-        if result["visibility"].as_str() != Some("private") || str_of(&result, "uid") != uid {
-            return Ok(Vec::new());
-        }
-        Ok(result["tracks"].as_array().cloned().unwrap_or_default())
-    }
-
     /// Имя для показа и ссылка на аватар 100×100.
     pub fn about(&self) -> Res<(String, Option<String>)> {
         let v = self.get("/account/about", &[])?;
@@ -1738,25 +1705,29 @@ impl Api {
         self.lyrics_until(track_id, None)
     }
 
-    /// A recording-specific lookup for language identification. Never attach account headers.
-    pub(crate) fn reference_lyrics(&self, track: &Track) -> Option<Lyrics> {
+    /// A public reference for this recording, requested under the separate sources session.
+    pub(crate) fn reference_lyrics(&self, track: &Track) -> Res<Option<Lyrics>> {
+        use std::io::Read;
+        let Some(session) = crate::resolver_login::credential() else { return Ok(None) };
         if track.artists.is_empty() || track.album_title.is_empty() || !track.version.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let seconds = ((track.duration_ms + 500) / 1000).to_string();
-        let response: Value = self.http.get("https://lrclib.net/api/get")
-            .header("User-Agent", "YM UNCENSORED (https://github.com/Ex3R/ym-uncensored)")
-            .timeout(Duration::from_millis(1500))
-            .query(&[("track_name", &track.title), ("artist_name", &track.artists),
-                ("album_name", &track.album_title), ("duration", &seconds)])
-            .send().ok()?.error_for_status().ok()?.json().ok()?;
-        for (field, expected) in [("trackName", &track.title), ("artistName", &track.artists), ("albumName", &track.album_title)] {
-            if response[field].as_str()?.trim().to_lowercase() != expected.trim().to_lowercase() { return None; }
-        }
-        if (response["duration"].as_f64()? * 1000.0 - track.duration_ms as f64).abs() > 2000.0 { return None; }
-        let lines = response["plainLyrics"].as_str()?.lines().map(str::to_owned).collect();
-        let synced = parse_lrc(response["syncedLyrics"].as_str().unwrap_or(""));
-        Some(Lyrics { text: lines, synced, ..Default::default() })
+        let body = serde_json::to_vec(&json!({
+            "title":track.title, "artists":track.artist_list.iter().map(|a| &a.name).collect::<Vec<_>>(),
+            "duration_ms":track.duration_ms,
+        })).map_err(|e| e.to_string())?;
+        let response = crate::resolver_login::signed("POST", "/reference", &session, body)?
+            .timeout(Duration::from_secs(15)).send().map_err(|e| e.to_string())?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND { return Ok(None); }
+        let response = response.error_for_status().map_err(|e| e.to_string())?;
+        let editions: Vec<Value> = serde_json::from_reader(response.take(262145)).map_err(|e| e.to_string())?;
+        let album = track.album_title.trim().to_lowercase();
+        let Some(data) = editions.iter().filter(|row| row["albumName"].as_str()
+            .is_some_and(|name| name.trim().to_lowercase() == album))
+            .max_by_key(|row| row["syncedLyrics"].as_str().is_some_and(|text| !text.is_empty())) else { return Ok(None) };
+        let text = data["plainLyrics"].as_str().unwrap_or("").lines().map(str::to_owned).collect();
+        let synced = parse_lrc(data["syncedLyrics"].as_str().unwrap_or(""));
+        Ok(Some(Lyrics { text, synced, ..Default::default() }))
     }
 
     pub(crate) fn lyrics_until(&self, track_id: &str, deadline: Option<Instant>) -> Res<Lyrics> {

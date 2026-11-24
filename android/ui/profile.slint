@@ -616,7 +616,7 @@ component SettingsPage inherits Screen {
         }
         SetRow {
             icons: root.icons;
-            title: "Справка";
+            title: "Обратная связь";
             kind: 2;
             clicked => { Prof.link("help"); }
         }
@@ -779,65 +779,79 @@ export component AboutPage inherits Rectangle {
         font-weight: 800;
         font-size: 30px;
     }
-    VerticalLayout {
-        y: root.height - self.preferred-height - 24px;
-        height: self.preferred-height;
-        Text {
-            text: "YM UNCENSORED " + Prof.version;
-            color: T.fg.with-alpha(0.48);
-            font-size: 15px;
-            horizontal-alignment: center;
-            TouchArea {
-                clicked => { Prof.link("update"); }
-            }
-        }
-        Rectangle { height: 16px; }
-        AboutLink {
-            title: "Лицензионное соглашение";
-            clicked => { Prof.link("terms"); }
-        }
-        AboutLink {
-            title: "Сторонние компоненты";
-            clicked => { Prof.link("components"); }
-        }
-        AboutLink {
-            title: "Политика конфиденциальности";
-            clicked => { Prof.link("privacy"); }
-        }
-        AboutLink {
-            title: "Правила рекомендаций";
-            clicked => { Prof.link("recommendations"); }
-        }
-        Rectangle {
-            height: 1px;
-            background: T.line;
-        }
-        Rectangle {
-            height: 80px;
+    Flickable {
+        y: 150px;
+        width: root.width;
+        height: max(0px, root.height - self.y);
+        content-width: self.width;
+        content-height: max(self.height, about.preferred-height + 24px);
+        about := VerticalLayout {
+            y: max(0px, parent.height - self.preferred-height - 24px);
+            width: root.width;
+            height: self.preferred-height;
             Text {
-                width: parent.width - 32px;
-                text: "Сервис Яндекс Музыка может содержать информацию, не предназначенную для несовершеннолетних";
+                text: "YM UNCENSORED " + Prof.version;
                 color: T.fg.with-alpha(0.48);
                 font-size: 15px;
-                wrap: word-wrap;
                 horizontal-alignment: center;
+                TouchArea {
+                    clicked => { Prof.link("update"); }
+                }
             }
-        }
-        Rectangle {
-            height: 1px;
-            background: T.line;
-        }
-        Text {
-            height: 72px;
-            text: "Неофициальный клиент Яндекс Музыки\ngithub.com/SpolzerMod/yamusic-rs";
-            color: T.fg.with-alpha(0.48);
-            font-size: 15px;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-            TouchArea {
+            Rectangle { height: 16px; }
+            AboutLink {
+                title: "Сайт · ym.idkroma.ru";
+                clicked => { Prof.link("website"); }
+            }
+            AboutLink {
+                title: "Условия сервиса Яндекс Музыки";
+                clicked => { Prof.link("terms"); }
+            }
+            AboutLink {
+                title: "Код и лицензии · GPL-3.0-only";
                 clicked => { Prof.link("components"); }
             }
+            AboutLink {
+                title: "Политика конфиденциальности";
+                clicked => { Prof.link("privacy"); }
+            }
+            AboutLink {
+                title: "Правила рекомендаций";
+                clicked => { Prof.link("recommendations"); }
+            }
+            Rectangle {
+                height: 1px;
+                background: T.line;
+            }
+            Rectangle {
+                height: 80px;
+                Text {
+                    width: parent.width - 32px;
+                    text: "Сервис Яндекс Музыка может содержать информацию, не предназначенную для несовершеннолетних";
+                    color: T.fg.with-alpha(0.48);
+                    font-size: 15px;
+                    wrap: word-wrap;
+                    horizontal-alignment: center;
+                }
+            }
+            Rectangle {
+                height: 1px;
+                background: T.line;
+            }
+            Text {
+                height: 72px;
+                text: "Основано на yamusic-rs · Spolzer\nПорт macOS: M1kage-dev · Форк: Ex3R";
+                wrap: word-wrap;
+                color: T.fg.with-alpha(0.48);
+                font-size: 15px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                TouchArea {
+                    clicked => { Prof.link("components"); }
+                }
+            }
         }
+
     }
 }
 

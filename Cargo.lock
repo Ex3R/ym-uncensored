@@ -6677,6 +6677,7 @@ dependencies = [
  "objc2-media-player",
  "raw-window-handle",
  "reqwest",
+ "ring",
  "rodio",
  "secret-service",
  "serde",

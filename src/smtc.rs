@@ -33,7 +33,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, MSG, PM_REMOVE, WNDCLASSW,
 };
 
-const AUMID: &str = "SpolzerMod.YaMusicRS";
+const AUMID: &str = "Ex3R.YMUncensored";
 
 /// `System.AppUserModel.ID` (`{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}`, pid 5).
 const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY {

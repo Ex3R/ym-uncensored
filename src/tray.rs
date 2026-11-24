@@ -155,7 +155,7 @@ fn show_menu(hwnd: HWND) {
         sep(menu);
         add(about, 6, &tr("Пользовательское соглашение"), true);
         add(about, 7, &tr("Правила рекомендаций"), true);
-        add(about, 8, &tr("Чат с поддержкой"), true);
+        add(about, 8, &tr("Обратная связь"), true);
         let w = wide(&tr("О приложении"));
         AppendMenuW(menu, MF_POPUP, about as usize, w.as_ptr());
         sep(menu);

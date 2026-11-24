@@ -43,11 +43,15 @@ impl Buf {
         if io::copy(&mut response.take(len + 1), &mut file)? != len {
             return Err(io::Error::other("incomplete audio"));
         }
-        Ok(Arc::new(Buf {
+        Ok(Self::from_complete_file(file, len))
+    }
+
+    pub fn from_complete_file(file: File, len: u64) -> Arc<Self> {
+        Arc::new(Buf {
             file,
             state: Mutex::new(State { have: len, len: Some(len), done: true, err: None }),
             cv: Condvar::new(),
-        }))
+        })
     }
 
     /// Качает ответ в фоне. Если соединение оборвалось, `reopen` открывает файл заново с нужного

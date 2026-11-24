@@ -106,24 +106,45 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn transcript(pcm: &[i16]) -> Option<Vec<String>> {
+fn full_speech_model() -> Option<&'static std::sync::Mutex<whisper_rs::WhisperContext>> {
     use std::sync::{Mutex, OnceLock};
     use whisper_rs::{WhisperContext, WhisperContextParameters};
     static SPEECH_MODEL: OnceLock<Option<Mutex<WhisperContext>>> = OnceLock::new();
-    let external = SPEECH_MODEL.get_or_init(|| {
+    SPEECH_MODEL.get_or_init(|| {
         whisper_rs::install_logging_hooks();
         let path = crate::config::dir().join("ggml-small-q5_1.bin");
+        #[cfg(test)]
+        let path = std::env::var_os("YM_VERIFICATION_MODEL").map(std::path::PathBuf::from).unwrap_or(path);
         if !path.is_file() {
+            #[cfg(target_os = "android")]
+            return crate::sys::speech_model().map(Mutex::new);
+            #[cfg(target_os = "windows")]
+            {
+                #[cfg(ym_windows_speech_model)]
+                return WhisperContext::new_from_buffer_with_params(include_bytes!(env!("YM_WINDOWS_SPEECH_MODEL")), Default::default()).ok().map(Mutex::new);
+                #[cfg(not(ym_windows_speech_model))]
+                return None;
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                let exe = std::env::current_exe().ok()?;
+                #[cfg(target_os = "linux")]
+                let resource = "../share/yamusic-rs/ggml-small-q5_1.bin";
+                #[cfg(target_os = "macos")]
+                let resource = "../Resources/ggml-small-q5_1.bin";
+                let model = exe.parent()?.join(resource);
+                return WhisperContext::new_with_params(model, Default::default()).ok().map(Mutex::new);
+            }
+            #[cfg(not(any(target_os="macos",target_os="linux",target_os="android",target_os="windows")))]
             return None;
         }
         WhisperContext::new_with_params(path, WhisperContextParameters::default())
             .ok()
             .map(Mutex::new)
-    });
-    let model = match external {
-        Some(model) => model.lock().ok()?,
-        None => crate::language::whisper_model()?,
-    };
+    }).as_ref()
+}
+
+fn transcript(pcm: &[i16], model: &whisper_rs::WhisperContext) -> Option<Vec<String>> {
     let mut state = model.create_state().ok()?;
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_language(Some("ru"));
@@ -247,6 +268,7 @@ pub(crate) fn compare(original: &Recording, candidate: &Recording, lyrics: &Lyri
         &original.pcm[a * 16..(a + len) * 16],
         &candidate.pcm[b * 16..(b + len) * 16],
     );
+    let mut windows = Vec::new();
     let mut tried = Vec::new();
     let all_text = lyrics.text.join(" ");
     for (score, offset) in scores {
@@ -280,18 +302,76 @@ pub(crate) fn compare(original: &Recording, candidate: &Recording, lyrics: &Lyri
         let begin = pos.saturating_sub(2500).max(a);
         let end = (pos + 2900).min(a + len);
         let at = begin.checked_add_signed(lag)?;
-        let before = transcript(&original.pcm[begin * 16..end * 16])?;
-        let after = transcript(&candidate.pcm[at * 16..(at + end - begin) * 16])?;
-        if restored(&before, &after, &expected) {
-            return Some(sec);
+        windows.push((sec, &original.pcm[begin * 16..end * 16], &candidate.pcm[at * 16..(at + end - begin) * 16], expected));
+    }
+    type SpeechWindow<'a> = (f32, &'a [i16], &'a [i16], Vec<String>);
+    let check = |model: &whisper_rs::WhisperContext, windows: &[SpeechWindow<'_>]| {
+        windows.iter().find_map(|(sec, before, after, expected)| {
+            let added = transcript(after, model)?;
+            if !restored(&[], &added, expected) { return None; }
+            let previous = transcript(before, model)?;
+            restored(&previous, &added, expected).then_some(*sec)
+        })
+    };
+    let fast = if lyrics.synced.is_empty() { 0 } else { windows.len().min(3) };
+    if fast > 0 {
+        if let Some(model) = crate::language::whisper_model() {
+            if let Some(time) = check(&model, &windows[..fast]) { return Some(time); }
         }
     }
-    None
+    if let Some(model) = full_speech_model() {
+        let model = model.lock().ok()?;
+        return check(&model, &windows);
+    }
+    let model = crate::language::whisper_model()?;
+    check(&model, &windows[fast..])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires local catalog audio, external audio, and a matching LRCLIB response"]
+    fn catalog_recording_pair() {
+        let env = |key| std::env::var(key).unwrap();
+        let ms = env("YM_DURATION_MS").parse().unwrap();
+        let read = |key| {
+            let file = std::fs::File::open(env(key)).unwrap();
+            Recording::decode(rodio::Decoder::new(std::io::BufReader::new(file)).unwrap(), ms).unwrap()
+        };
+        let baseline = read("YM_BASELINE_AUDIO");
+        let candidate = read("YM_EXTERNAL_AUDIO");
+        let data: serde_json::Value = serde_json::from_slice(&std::fs::read(env("YM_REFERENCE_LYRICS")).unwrap()).unwrap();
+        let lyrics = Lyrics {
+            synced: crate::api::parse_lrc(data["syncedLyrics"].as_str().unwrap_or("")),
+            text: data["plainLyrics"].as_str().unwrap_or("").lines().map(str::to_owned).collect(),
+            ..Default::default()
+        };
+        let result = compare(&baseline, &candidate, &lyrics);
+        eprintln!("restored speech at {result:?}");
+        assert_eq!(result.is_some(), env("YM_EXPECT_RESTORED") == "yes");
+    }
+
+    #[test]
+    #[ignore = "requires a real external recording downloaded by the authenticated service"]
+    fn external_recording_pair() {
+        let dir = std::path::PathBuf::from(std::env::var_os("YM_VERIFICATION_FIXTURES").unwrap());
+        let read = |path: std::path::PathBuf| Recording::decode(
+            rodio::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap(), 174000).unwrap();
+        let baseline = read(dir.join("groupie-ym.mp3"));
+        let alternative = read(std::env::var_os("YM_EXTERNAL_AUDIO").unwrap().into());
+        let lyrics = Lyrics { synced: crate::api::parse_lrc(&std::fs::read_to_string(dir.join("groupie.lrc")).unwrap()), ..Default::default() };
+        assert_eq!(compare(&baseline, &baseline, &lyrics), None);
+        assert_eq!(compare(&baseline, &read(dir.join("groupie-recoded.mp3")), &lyrics), None);
+        assert_eq!(compare(&alternative, &baseline, &lyrics), None);
+        if let Some(path) = std::env::var_os("YM_EXTERNAL_UNCONFIRMED") {
+            assert_eq!(compare(&baseline, &read(path.into()), &lyrics), None);
+        }
+        let restored = compare(&baseline, &alternative, &lyrics);
+        eprintln!("external recording: restored speech at {restored:?}");
+        assert!(restored.is_some());
+    }
+
     #[test]
     #[ignore = "local recording pairs in YM_VERIFICATION_FIXTURES"]
     fn real_recording_pairs() {

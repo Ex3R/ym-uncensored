@@ -13,6 +13,12 @@ pub fn init(app: &AndroidApp) {
     let _ = APP.set(app.clone());
 }
 
+pub(crate) fn speech_model() -> Option<whisper_rs::WhisperContext> {
+    let assets = APP.get()?.asset_manager();
+    let mut model = assets.open(c"ggml-small-q5_1.bin")?;
+    whisper_rs::WhisperContext::new_from_buffer_with_params(model.buffer().ok()?, Default::default()).ok()
+}
+
 fn files_dir() -> PathBuf {
     APP.get().and_then(|a| a.internal_data_path()).unwrap_or_else(|| PathBuf::from("/data/local/tmp"))
 }
