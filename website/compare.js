@@ -7,6 +7,8 @@
   const clock = card.querySelector("#clock");
   const message = card.querySelector("#ab-status");
   const length = 60;
+  const repeat = card.querySelector("#repeat-phrase");
+  let loopRange = null;
   let context, buffers, loading, gains, pair, startTime, startOffset = 0;
   let position = 0, generation = 0, frame = 0, levels, pending = false;
 
@@ -15,7 +17,10 @@
     return Math.floor(whole / 60) + ":" + String(whole % 60).padStart(2, "0");
   }
   function now() {
-    return pair ? Math.min(length, startOffset + Math.max(0, context.currentTime - startTime)) : position;
+    if (!pair) return position;
+    const raw = startOffset + Math.max(0, context.currentTime - startTime);
+    if (loopRange && raw >= loopRange.end) return loopRange.start + (raw-loopRange.end) % (loopRange.end-loopRange.start);
+    return Math.min(length,raw);
   }
   function paint() {
     const sec = now();
@@ -40,13 +45,24 @@
         g.fillRect(i*w/count, (h-bar)/2, 2, bar);
       }
     }
+    if (loopRange) {
+      g.fillStyle="#ffd2ef30";g.fillRect(w*loopRange.start/length,0,w*(loopRange.end-loopRange.start)/length,h);
+    }
     g.fillStyle="#fff"; g.fillRect(Math.min(w-2,sec/length*w),0,2,h);
   }
   function tick() {
     paint();
     if (pair) frame=requestAnimationFrame(tick);
   }
+  function editionState(playing) {
+    card.querySelectorAll("[data-mix]").forEach(b=>{
+      const active=playing && Number(b.dataset.mix)===Number(mix.value);
+      b.setAttribute("aria-pressed",String(active));
+      b.firstElementChild.textContent=active ? "●" : "▶";
+    });
+  }
   function setPlay(playing) {
+    editionState(playing);
     play.setAttribute("aria-label", playing ? "Пауза" : "Воспроизвести");
     play.setAttribute("aria-pressed", String(playing));
     play.firstElementChild.textContent = playing ? "Ⅱ" : "▶";
@@ -71,7 +87,7 @@
       if (pair) gain.setTargetAtTime(value,context.currentTime,.009);
       else gain.setValueAtTime(value,context.currentTime);
     });
-    card.querySelectorAll("[data-mix]").forEach(b => b.setAttribute("aria-pressed",String(Number(b.dataset.mix)===Number(mix.value))));
+    editionState(Boolean(pair));
     mix.setAttribute("aria-valuetext", t===0 ? "С цензурой" : t===1 ? "Без цензуры" : "Без цензуры "+mix.value+" процентов");
     paint();
   }
@@ -79,7 +95,7 @@
     if (buffers) return;
     if (!loading) {
       loading=Promise.all(["yandex","original"].map(async name => {
-        const response=await fetch("assets/groupie/"+name+".m4a");
+        const response=await fetch("assets/groupie/"+name+".m4a?cut=89");
         if (!response.ok) throw new Error("audio unavailable");
         const buffer=await context.decodeAudioData(await response.arrayBuffer());
         if (buffer.duration < length-.02) throw new Error("incomplete audio");
@@ -107,14 +123,18 @@
       startTime=context.currentTime+.045;
       pair=buffers.map((buffer,i) => {
         const src=context.createBufferSource();
-        src.buffer=buffer; src.connect(gains[i]); return src;
+        src.buffer=buffer; src.connect(gains[i]);
+        if (loopRange) {
+          src.loop=true; src.loopStart=loopRange.start; src.loopEnd=loopRange.end;
+        }
+        return src;
       });
       pair[0].onended=() => {
         if (id!==generation) return;
         const finished=pair; pair=null; finished.forEach(s=>s.disconnect());
         position=length; cancelAnimationFrame(frame); setPlay(false); paint();
       };
-      pair.forEach(src=>src.start(startTime,startOffset,length-startOffset));
+      pair.forEach(src=>src.start(startTime,startOffset));
       pending=false; message.textContent=""; setPlay(true); tick();
     } catch (_) {
       if (id!==generation) return;
@@ -123,15 +143,36 @@
   }
   function seek(seconds, autoplay=false) {
     const resume=Boolean(pair)||pending||autoplay;
-    stop(); position=Math.max(0,Math.min(length,seconds)); paint();
+    stop(); position=Math.max(0,Math.min(length,seconds));
+    if (loopRange && (position<loopRange.start || position>=loopRange.end)) {
+      loopRange=null; repeat.setAttribute("aria-pressed","false");
+    }
+    paint();
     if (resume && position<length) begin();
   }
   play.addEventListener("click",()=>{ if(pair||pending){stop();message.textContent="";}else begin(); });
   timeline.addEventListener("input",()=>seek(Number(timeline.value)));
   mix.addEventListener("input",balance);
-  card.querySelectorAll("[data-mix]").forEach(b=>b.addEventListener("click",()=>{mix.value=b.dataset.mix;balance();}));
-  card.querySelectorAll("[data-time]").forEach(b=>b.addEventListener("click",()=>seek(Number(b.dataset.time),true)));
-  fetch("assets/groupie/wave.json").then(r=>r.json()).then(data=>{levels=data;paint();}).catch(()=>{});
+  card.querySelectorAll("[data-mix]").forEach(button=>button.addEventListener("click",()=>{
+    mix.value=button.dataset.mix;
+    balance();
+    if (!pair && !pending) begin();
+  }));
+  repeat.addEventListener("click",()=>{
+    const wasPlaying=Boolean(pair)||pending;
+    stop();
+    if (loopRange) {
+      loopRange=null;
+    } else {
+      const start=Math.max(0,Math.min(length-4.5,position-1));
+      loopRange={start,end:start+4.5};
+      position=start;
+    }
+    repeat.setAttribute("aria-pressed",String(Boolean(loopRange)));
+    paint();
+    if (wasPlaying||loopRange) begin();
+  });
+  fetch("assets/groupie/wave.json?cut=89").then(r=>r.json()).then(data=>{levels=data;paint();}).catch(()=>{});
   window.addEventListener("resize",paint);
   window.addEventListener("pagehide",stop);
   balance();
