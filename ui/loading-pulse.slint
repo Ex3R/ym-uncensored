@@ -1,0 +1,22 @@
+export component LoadingPulse inherits Rectangle {
+    in property <length> diameter: 40px;
+    in property <bool> motion: true;
+    width: diameter;
+    height: diameter;
+    border-radius: diameter / 2;
+    background: #102b27;
+    border-width: 1px;
+    border-color: #92edcc66;
+
+    property <angle> phase: motion ? mod(animation-tick() / 1450ms, 1) * 360deg : 0deg;
+    for i in 7: Rectangle {
+        property <float> crest: (1 + cos(root.phase - (i - 3) * 48deg)) / 2;
+        property <float> envelope: 1 - abs(i - 3) * 0.15;
+        width: root.diameter * 0.055;
+        height: root.diameter * (0.08 + 0.38 * envelope * crest);
+        x: (root.width - self.width) / 2 + root.diameter * 0.088 * (i - 3);
+        y: (root.height - self.height) / 2;
+        border-radius: self.width / 2;
+        background: #61bc9d.mix(#dbffed, crest);
+    }
+}

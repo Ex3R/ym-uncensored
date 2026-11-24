@@ -1,0 +1,136 @@
+workflow:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+    - if: '$CI_PIPELINE_SOURCE == "api" && $DESKTOP_REMOTE_ONLY == "1"'
+    - when: never
+
+stages: [build, release]
+
+variables:
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "8"
+  RELEASE_VERSION: "v0.1.0"
+
+.linux:
+  stage: build
+  rules:
+    - if: '$DESKTOP_REMOTE_ONLY == "1" && $WINDOWS_ONLY == "1"'
+      when: never
+    - when: on_success
+  image: rust:1.100-bookworm
+  script:
+    - apt-get update -qq
+    - apt-get install -y -qq cmake libclang-dev libasound2-dev libfontconfig1-dev libfreetype-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libx11-xcb-dev libxcursor-dev libxi-dev libxrandr-dev
+    - cargo test --release --locked
+    - cargo build --release --locked
+    - tools/appimage.sh
+    - mkdir dist
+    - cp target/appimage/yamusic-rs-*.AppImage "dist/ym-uncensored-${CI_COMMIT_TAG:-$RELEASE_VERSION}-linux-$(uname -m).AppImage"
+  artifacts:
+    paths: [dist/]
+    expire_in: 1 week
+
+linux-x64:
+  extends: .linux
+  tags: [saas-linux-medium-amd64]
+
+linux-arm64:
+  extends: .linux
+  tags: [saas-linux-medium-arm64]
+
+windows-x64:
+  stage: build
+  tags: [saas-windows-medium-amd64]
+  variables:
+    CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "32"
+  script:
+    - |
+      if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+        Invoke-WebRequest 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe' -OutFile "$env:TEMP\rustup-init.exe"
+        & "$env:TEMP\rustup-init.exe" -y --no-modify-path --profile minimal --default-toolchain 1.100.0
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
+      }
+      rustup toolchain install 1.100.0 --profile minimal
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # The hosted service account has no interactive Windows DPAPI profile.
+      cargo +1.100.0 test --release --locked -- --skip secret::tests::roundtrip
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      cargo +1.100.0 build --release --locked
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      New-Item -Type Directory -Path dist, package
+      Copy-Item target\release\yamusic-rs.exe 'package\YM UNCENSORED.exe'
+      Copy-Item LICENSE package
+      Copy-Item models\*-LICENSE package
+      $version = if ($env:CI_COMMIT_TAG) { $env:CI_COMMIT_TAG } else { $env:RELEASE_VERSION }
+      Compress-Archive -Path 'package\*' -DestinationPath "dist\ym-uncensored-$version-windows-x64.zip"
+  artifacts:
+    paths: [dist/]
+    expire_in: 1 week
+
+macos-universal:
+  stage: build
+  rules:
+    - if: '$DESKTOP_REMOTE_ONLY == "1"'
+      when: never
+    - when: on_success
+  tags: [saas-macos-large-m2pro]
+  image: macos-26-xcode-26
+  script:
+    - rustup toolchain install 1.100.0 --profile minimal
+    - export RUSTUP_TOOLCHAIN=1.100.0
+    - cargo test --release --locked
+    - tools/macos-app.sh --universal --dmg
+    - codesign --verify --deep --strict 'target/macos/YM UNCENSORED.app'
+    - lipo -verify_arch arm64 x86_64 'target/macos/YM UNCENSORED.app/Contents/MacOS/yamusic-rs'
+    - test ! -e 'target/macos/YM UNCENSORED.app/Contents/Resources/originals.json'
+    - mkdir dist
+    - cp target/macos/ym-uncensored-*-macos.dmg "dist/ym-uncensored-${CI_COMMIT_TAG}-macos-universal.dmg"
+  artifacts:
+    paths: [dist/]
+    expire_in: 1 week
+
+android-arm64:
+  stage: build
+  rules:
+    - if: '$DESKTOP_REMOTE_ONLY == "1"'
+      when: never
+    - when: on_success
+  tags: [saas-linux-medium-amd64]
+  image: rust:1.100-bookworm
+  variables:
+    REQUIRE_RELEASE_SIGNATURE: "1"
+    ANDROID_SDK_TOOLS: "13114758"
+  script:
+    - apt-get update -qq
+    - apt-get install -y -qq curl unzip zip openjdk-17-jdk-headless clang libclang-dev cmake
+    - export ANDROID_HOME="$CI_PROJECT_DIR/.android-sdk" JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+    - mkdir -p "$ANDROID_HOME"
+    - curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-${ANDROID_SDK_TOOLS}_latest.zip" -o /tmp/android-tools.zip
+    - unzip -q /tmp/android-tools.zip -d "$ANDROID_HOME"
+    - |
+      sdk="$ANDROID_HOME/cmdline-tools/bin/sdkmanager"
+      set +o pipefail
+      yes | "$sdk" --sdk_root="$ANDROID_HOME" --licenses >/dev/null
+      set -o pipefail
+      "$sdk" --sdk_root="$ANDROID_HOME" 'platforms;android-35' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+    - rustup target add aarch64-linux-android
+    - tools/apk.sh
+    - mkdir dist
+    - cp target/apk/yamusic-rs-arm64-v8a.apk "dist/ym-uncensored-${CI_COMMIT_TAG}-android-arm64.apk"
+  artifacts:
+    paths: [dist/]
+    expire_in: 1 week
+
+release:
+  stage: release
+  rules:
+    - if: '$CI_COMMIT_TAG && $DESKTOP_REMOTE_ONLY != "1"'
+  image: registry.gitlab.com/gitlab-org/cli:latest
+  variables:
+    GLAB_ENABLE_CI_AUTOLOGIN: "true"
+  needs: [linux-x64, linux-arm64, windows-x64, macos-universal, android-arm64]
+  script:
+    - '(cd dist && sha256sum *.AppImage *.zip *.dmg *.apk > SHA256SUMS)'
+    - glab release create "$CI_COMMIT_TAG" dist/* --name "YM UNCENSORED $CI_COMMIT_TAG" --notes-file docs/first-release.md --use-package-registry

@@ -1,0 +1,173 @@
+# Windows и Linux x86-64: только clippy и тесты. macOS: также universal DMG.
+# Тег v*: релиз с одним macOS DMG.
+name: Сборка
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Зависимости сборки
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libasound2-dev libfontconfig1-dev libfreetype-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-dev libx11-xcb-dev \
+            libxcursor-dev libxi-dev libxrandr-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release
+
+  # macOS: две архитектуры одним универсальным бинарём. Тесты и clippy — один раз,
+  # сборка и упаковка — через tools/macos-app.sh, он же собирает universal через lipo.
+  # macos-latest — всегда доступная метка Apple Silicon; конкретную версию (macos-14)
+  # GitHub снимает с раннеров, и job отменяется, не начавшись.
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    outputs:
+      dmg-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Тег совпадает с версией в Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Тег $GITHUB_REF_NAME, а в Cargo.toml версия $v"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      # Значок рендерится из SVG: без librsvg скрипт соберёт его из готового 256 px.
+      - name: librsvg для значка
+        run: brew install librsvg
+
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release
+
+      # Сборка двух срезов отдельно: если что-то зависнет, видно, что именно, а не «шаг идёт час».
+      - name: Сборка arm64 и x86_64
+        timeout-minutes: 30
+        run: |
+          export RUSTFLAGS="--remap-path-prefix=$HOME=/build"
+          export CFLAGS="-ffile-prefix-map=$HOME=/build" CXXFLAGS="-ffile-prefix-map=$HOME=/build"
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+      # Подпись — ad-hoc: для запуска на Apple Silicon её достаточно, а свой сертификат
+      # нужен был только ради постоянной личности в связке ключей, от которой мы отказались.
+      - name: Бандл, .dmg и подпись
+        timeout-minutes: 15
+        run: tools/macos-app.sh --universal --skip-build --dmg
+
+      - name: Проверка подписи и архитектур
+        run: |
+          codesign --verify --deep --strict "target/macos/YM UNCENSORED.app"
+          echo "подпись: $(codesign -dvv "target/macos/YM UNCENSORED.app" 2>&1 | grep -E 'Authority|Signature=' | tr '\n' ' ')"
+          archs=$(lipo -archs "target/macos/YM UNCENSORED.app/Contents/MacOS/yamusic-rs")
+          echo "архитектуры: $archs"
+          case "$archs" in
+            'x86_64 arm64'|'arm64 x86_64') ;;
+            *) echo '::error::Ожидались срезы x86_64 и arm64'; exit 1 ;;
+          esac
+
+      - name: SHA-256
+        run: shasum -a 256 target/macos/*.dmg
+
+      - uses: actions/upload-artifact@v7
+        id: upload
+        with:
+          path: target/macos/ym-uncensored-*-macos.dmg
+          if-no-files-found: error
+          archive: false
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.macos.outputs.dmg-id }}
+          path: dist
+
+      # Описание релиза — раздел из CHANGELOG.md. Нет раздела — релиз не собираем:
+      # так история изменений не отстаёт от тегов.
+      - name: Заметки из CHANGELOG.md
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          awk -v v="$v" '
+            index($0, "## [" v "]") == 1 { hit = 1; next }
+            hit && index($0, "## [") == 1 { exit }
+            hit { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::В CHANGELOG.md нет раздела «## [${v}]»"
+            exit 1
+          fi
+          {
+            echo "Версия \`$v\` — сборка macOS-форка. Установка и ограничения: README.md."
+            echo
+            cat notes.md
+          } > body.md
+
+      - name: Релиз с контрольной суммой DMG
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          shopt -s nullglob dotglob
+          files=(dist/*)
+          if [[ ${#files[@]} -ne 1 || ! -f ${files[0]} || ${files[0]} != dist/ym-uncensored-*-macos.dmg ]]; then
+            echo '::error::В dist должен быть ровно один macOS DMG'
+            exit 1
+          fi
+          dmg=${files[0]}
+          sha=$(sha256sum "$dmg" | cut -d' ' -f1)
+          {
+            cat body.md
+            echo
+            echo "## Контрольные суммы SHA-256"
+            echo
+            echo "| Файл | SHA-256 |"
+            echo "| --- | --- |"
+            echo "| \`${dmg##*/}\` | \`$sha\` |"
+          } > full.md
+          gh release create "$GITHUB_REF_NAME" "$dmg" --title "YM UNCENSORED ${GITHUB_REF_NAME#v}" --notes-file full.md

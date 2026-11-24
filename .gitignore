@@ -1,0 +1,12 @@
+target/
+.env
+originals.json
+*.jks
+*.p12
+__pycache__/
+*.py[cod]
+.DS_Store
+.env.*
+wave_state.json
+*.keystore
+*.mobileprovision
