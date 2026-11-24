@@ -432,22 +432,24 @@ fn verified_known(
 ) -> Option<Audio> {
     use crate::originals;
     if !current() { return None; }
-    let metadata = originals::public_metadata(track)?;
+    if !originals::can_match(track) { return None; }
     let token = crate::resolver_login::credential()?;
-    let hit = originals::known_candidate(&track.id, metadata, &token, current)?;
+    let hit = originals::known_candidate(track, &token, current)?;
+    let proof = hit.proof_id()?;
     if !current() || !found() { return None; }
-    let media = originals::known_audio(&hit, &track.id, token, current, |alternative| {
+    if !originals::same_proof_recording(track, proof, |ids| api.tracks(ids)) || !current() { return None; }
+    let media = originals::known_audio(&hit, proof, token, current, |alternative| {
         let public = api.tracks(&[alternative.into()]).ok()?.into_iter()
-            .any(|t| t.id == alternative && originals::can_match(&t));
+            .any(|t| t.id == alternative && t.catalog_id() != track.catalog_id() && originals::can_match(&t));
         if !public || !current() { return None; }
         load_media(api, alternative).ok()
     })?;
     let digest = originals::complete_digest(&baseline()?, current)?;
-    if !hit.matches(&track.id, &digest) { return None; }
+    if !hit.matches(proof, &digest) { return None; }
     let decoder = open_decoder(&media.buf).ok()?;
     if !current() { return None; }
     let audio = (media.buf.clone(), decoder, media.format.clone());
-    originals::cache_known(&hit, &track.id, &media);
+    originals::cache_known(&hit, proof, &media);
     Some(audio)
 }
 
@@ -548,7 +550,7 @@ fn resolve_track(
         let try_external = |candidates: Vec<originals::OnlineCandidate>| {
             for candidate in candidates {
                 if !current() { return None; }
-                if let Ok(result) = originals::online_audio(&candidate,&t.id,original_digest(),current)
+                if let Ok(result) = originals::online_audio(&candidate,t,original_digest(),current)
                     .inspect_err(|_| { retry.set(true); log("Замена: ошибка загрузки аудио"); }) {
                     if let Ok(decoder) = open_decoder(&result.buf) {
                         let audio = (result.buf.clone(),decoder,result.format.clone());
@@ -556,11 +558,11 @@ fn resolve_track(
                         if result.cached {
                             log(format!("Замена {}: подтверждённое аудио из кэша",t.id));
                             // Migrate a previously verified, baseline-bound v0.2.2 cache hit.
-                            originals::remember_external(result, &candidate, &t.id, original_digest());
+                            originals::remember_external(result, &candidate, t.catalog_id(), original_digest());
                             return Some(audio);
                         }
                         if let Some(audio) = check(audio) {
-                            originals::remember_external(result,&candidate,&t.id,original_digest());
+                            originals::remember_external(result,&candidate,t.catalog_id(),original_digest());
                             return Some(audio);
                         }
                     }

@@ -1,6 +1,6 @@
 //! Resolve an audio-only substitution for an exact catalog track on the owner's account.
 
-use crate::api::{Api, Res, Track};
+use crate::api::{Api, Res, Track, public_catalog_id};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -95,12 +95,8 @@ pub fn verified(api: &Api, original: &crate::verification::Recording, candidate:
     })
 }
 
-fn catalog_id(id: &str) -> bool {
-    (1..=20).contains(&id.len()) && !id.starts_with('0') && id.bytes().all(|b| b.is_ascii_digit())
-}
-
 pub fn can_match(track: &Track) -> bool {
-    !track.user_upload && track.duration_ms > 0 && catalog_id(&track.id)
+    !track.user_upload && track.duration_ms > 0 && public_catalog_id(&track.id)
 }
 
 pub fn should_uncensor(
@@ -161,7 +157,7 @@ fn catalog_candidates<'a>(track: &Track, candidates: &'a [Track]) -> Vec<&'a str
     let source_marker = version_marker.or(source_marker);
     let Some(recording_key) = recording(title, track.artist_list.iter().map(|a| a.id.clone())) else { return vec![] };
     let hits = candidates.iter().filter(|candidate| {
-        if candidate.id == track.id || !can_match(candidate)
+        if candidate.catalog_id() == track.catalog_id() || !can_match(candidate)
             || track.duration_ms.abs_diff(candidate.duration_ms) > MATCH_TOLERANCE_MS
         {
             return false;
@@ -176,7 +172,7 @@ fn catalog_candidates<'a>(track: &Track, candidates: &'a [Track]) -> Vec<&'a str
             && stable_version == candidate_version
             && recording(candidate_title, candidate.artist_list.iter().map(|a| a.id.clone())).as_ref() == Some(&recording_key)
     });
-    hits.map(|candidate| candidate.id.as_str()).collect()
+    hits.map(|candidate| candidate.catalog_id()).collect()
 }
 
 pub fn catalog_versions(api: &Api, track: &Track) -> Vec<String> {
@@ -269,13 +265,22 @@ pub fn online_next(next: &str) -> Res<Vec<OnlineCandidate>> {
 pub struct KnownCandidate {
     #[serde(flatten)]
     candidate: OnlineCandidate,
+    #[serde(default, deserialize_with = "read_proof_id")]
+    proof_catalog_id: Option<String>,
     baseline_sha256: Option<String>,
     pair_sha256: Option<String>,
     #[serde(default)]
     baseline_sha256s: Vec<String>,
 }
 
+fn read_proof_id<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<String>, D::Error> {
+    let id = String::deserialize(value)?;
+    if public_catalog_id(&id) { Ok(Some(id)) } else { Err(serde::de::Error::custom("invalid catalog id")) }
+}
+
 impl KnownCandidate {
+    pub fn proof_id(&self) -> Option<&str> { self.proof_catalog_id.as_deref() }
+
     fn is_yandex(&self) -> bool { self.candidate.source == "Yandex Music" }
 
     fn valid(&self, track: &str) -> bool {
@@ -305,23 +310,53 @@ impl KnownCandidate {
     }
 }
 
-fn lookup_known(track: &str, mut metadata: serde_json::Value, mut post: impl FnMut(&serde_json::Value) -> Res<reqwest::blocking::Response>) -> Option<KnownCandidate> {
-    metadata["catalog_id"] = track.into();
-    metadata["include_yandex"] = true.into();
-    let mut response = post(&metadata).ok()?;
-    let legacy = response.status() == reqwest::StatusCode::BAD_REQUEST;
-    if legacy {
-        metadata.as_object_mut()?.remove("include_yandex");
-        response = post(&metadata).ok()?;
-    }
-    if response.status() != reqwest::StatusCode::OK { return None; }
-    let hits: Vec<KnownCandidate> = read_json(response).ok()?;
-    let [hit]: [KnownCandidate; 1] = hits.try_into().ok()?;
-    (hit.valid(track) && !(legacy && hit.is_yandex())).then_some(hit)
+/// Only the current public catalog can establish that different queue and receipt IDs
+/// identify the same recording. A title, duration or server-provided ID is insufficient.
+pub fn same_proof_recording(track: &Track, proof: &str, get: impl FnOnce(&[String]) -> Res<Vec<Track>>) -> bool {
+    if !can_match(track) || !public_catalog_id(proof) { return false; }
+    if track.id == proof { return true; }
+    let Ok(rows) = get(&[track.id.clone(), proof.into()]) else { return false };
+    let find = |id: &str| rows.iter().find(|row| row.id == id && can_match(row));
+    let (Some(playing), Some(cited)) = (find(&track.id), find(proof)) else { return false };
+    playing.catalog_id() == cited.catalog_id()
+        && (track.catalog_id() == track.id || track.catalog_id() == playing.catalog_id())
 }
 
-pub fn known_candidate(track: &str, metadata: serde_json::Value, token: &str, current: &impl Fn() -> bool) -> Option<KnownCandidate> {
-    lookup_known(track, metadata, |body| {
+fn lookup_known(canonical: &str, original: &str, mut metadata: serde_json::Value, mut post: impl FnMut(&serde_json::Value) -> Res<reqwest::blocking::Response>) -> Option<KnownCandidate> {
+    metadata["catalog_id"] = canonical.into();
+    metadata["include_yandex"] = true.into();
+    metadata["include_aliases"] = true.into();
+    let mut response = post(&metadata).ok()?;
+    let aliases = response.status() != reqwest::StatusCode::BAD_REQUEST;
+    if !aliases {
+        metadata.as_object_mut()?.remove("include_aliases");
+        response = post(&metadata).ok()?;
+        if response.status() == reqwest::StatusCode::BAD_REQUEST {
+            metadata.as_object_mut()?.remove("include_yandex");
+            response = post(&metadata).ok()?;
+        }
+    }
+    let read_hits = |response: reqwest::blocking::Response| {
+        if response.status() != reqwest::StatusCode::OK { return None; }
+        read_json::<Vec<KnownCandidate>>(response).ok()
+    };
+    let mut hits = read_hits(response)?;
+    let mut requested = canonical;
+    if !aliases && hits.is_empty() && original != canonical {
+        // Older services indexed receipts only by the exact queue ID.
+        requested = original;
+        metadata["catalog_id"] = original.into();
+        hits = read_hits(post(&metadata).ok()?)?;
+    }
+    let [mut hit]: [KnownCandidate; 1] = hits.try_into().ok()?;
+    if (!aliases && hit.proof_catalog_id.is_some()) || (hit.is_yandex() && metadata.get("include_yandex").is_none()) { return None; }
+    if !hit.valid(requested) { return None; }
+    hit.proof_catalog_id.get_or_insert_with(|| requested.to_owned());
+    Some(hit)
+}
+
+pub fn known_candidate(track: &Track, token: &str, current: &impl Fn() -> bool) -> Option<KnownCandidate> {
+    lookup_known(track.catalog_id(), &track.id, public_metadata(track)?, |body| {
         if !current() { return Err("Выбор трека изменился".into()); }
         post_metadata("/known", token, body, Duration::from_secs(4))
     })
@@ -335,7 +370,7 @@ struct CatalogRedemption {
 
 impl CatalogRedemption {
     fn checked_id(self, original: &str) -> Option<String> {
-        (self.alternative_id != original && catalog_id(&self.alternative_id)).then_some(self.alternative_id)
+        (self.alternative_id != original && public_catalog_id(&self.alternative_id)).then_some(self.alternative_id)
     }
 }
 
@@ -430,24 +465,25 @@ pub fn cache_known(hit: &KnownCandidate, track: &str, audio: &ExternalAudio) {
     }
 }
 
-pub fn online_audio(candidate: &OnlineCandidate, track: &str, original: Option<&str>, current: &impl Fn() -> bool) -> Res<ExternalAudio> {
+pub fn online_audio(candidate: &OnlineCandidate, track: &Track, original: Option<&str>, current: &impl Fn() -> bool) -> Res<ExternalAudio> {
     let token = resolver_login::credential().ok_or("Сначала подключите внешние источники")?;
     let cached = original.zip(candidate.sha256.as_deref()).and_then(|(baseline, media)| {
         if !digest_valid(media) { return None; }
-        cached_audio(&token, track, media, &pair_digest(track, baseline, media), Some(baseline))
+        let read = |id| cached_audio(&token, id, media, &pair_digest(id, baseline, media), Some(baseline));
+        read(track.catalog_id()).or_else(|| if track.catalog_id() != track.id { read(&track.id) } else { None })
     });
     fetch_audio(candidate, token, cached, Duration::from_secs(48), current)
 }
 
 fn catalog_confirmation(track: &Track, alternative: &str, baseline: &str, media: &str) -> Option<serde_json::Value> {
-    if !catalog_id(alternative) || alternative == track.id || baseline == media || !digest_valid(baseline) || !digest_valid(media) {
+    if !public_catalog_id(alternative) || alternative == track.catalog_id() || alternative == track.id || baseline == media || !digest_valid(baseline) || !digest_valid(media) {
         return None;
     }
     let mut body = public_metadata(track)?;
-    body["catalog_id"] = track.id.clone().into();
+    body["catalog_id"] = track.catalog_id().into();
     body["alternative_id"] = alternative.into();
     body["sha256"] = media.into();
-    body["pair_sha256"] = pair_digest(&track.id, baseline, media).into();
+    body["pair_sha256"] = pair_digest(track.catalog_id(), baseline, media).into();
     Some(body)
 }
 
@@ -523,29 +559,92 @@ mod tests {
     fn known_retries_only_an_old_servers_400_and_keeps_yandex_out_of_external_audio() {
         let metadata = serde_json::json!({"title":"song","artists":["A"],"duration_ms":1000});
         let data = serde_json::json!([{"source":"Yandex Music","ticket":"1".repeat(32),"sha256":"a".repeat(64),"pair_sha256":"b".repeat(64)}]);
-        let hit = lookup_known("7", metadata.clone(), |_| Ok(json_response(200, &data))).unwrap();
+        let hit = lookup_known("7", "7", metadata.clone(), |_| Ok(json_response(200, &data))).unwrap();
         assert!(hit.is_yandex() && !hit.candidate.valid());
         let mut external = data.clone();
         external[0]["source"] = "Bandcamp".into();
         let mut sent = vec![];
-        let old = lookup_known("7", metadata.clone(), |body| {
+        let old = lookup_known("7", "7", metadata.clone(), |body| {
             sent.push(body.clone());
-            Ok(if sent.len() == 1 { json_response(400, &serde_json::Value::Null) } else { json_response(200, &external) })
+            Ok(if sent.len() <= 2 { json_response(400, &serde_json::Value::Null) } else { json_response(200, &external) })
         }).unwrap();
         assert!(old.candidate.valid());
-        assert_eq!(sent.len(), 2);
-        assert_eq!(sent[0].as_object_mut().unwrap().remove("include_yandex"), Some(true.into()));
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[0].as_object_mut().unwrap().remove("include_aliases"), Some(true.into()));
         assert_eq!(sent[0], sent[1]);
+        assert_eq!(sent[1].as_object_mut().unwrap().remove("include_yandex"), Some(true.into()));
+        assert_eq!(sent[1], sent[2]);
         assert_eq!(sent[1]["catalog_id"], "7");
         for status in [401,403,404,500] {
             let mut attempts = 0;
-            assert!(lookup_known("7", metadata.clone(), |_| { attempts += 1; Ok(json_response(status, &data)) }).is_none());
+            assert!(lookup_known("7", "7", metadata.clone(), |_| { attempts += 1; Ok(json_response(status, &data)) }).is_none());
             assert_eq!(attempts, 1);
         }
         let mut operator_only = data;
         operator_only[0].as_object_mut().unwrap().remove("pair_sha256");
         operator_only[0]["baseline_sha256"] = "b".repeat(64).into();
-        assert!(lookup_known("7", metadata, |_| Ok(json_response(200, &operator_only))).is_none());
+        assert!(lookup_known("7", "7", metadata, |_| Ok(json_response(200, &operator_only))).is_none());
+    }
+
+    #[test]
+    fn receipt_alias_requires_both_catalog_rows_and_the_original_pair_id() {
+        let make = |id: &str, real: &str| crate::api::parse_track(&serde_json::json!({
+            "id": id, "realId": real, "title": "Song", "durationMs": 120000, "artists": [{"id": 1, "name": "Artist"}]
+        })).unwrap();
+        for (old, canonical) in [("57878398", "148716915"), ("113820638", "148715960")] {
+            let queue = make(old, canonical);
+            assert_eq!(queue.id, old);
+            assert_eq!(queue.catalog_id(), canonical);
+            let alt = "999";
+            let (baseline, media) = ("a".repeat(64), "b".repeat(64));
+            let new = catalog_confirmation(&queue, alt, &baseline, &media).unwrap();
+            assert_eq!(new["catalog_id"], canonical);
+            assert_eq!(new["pair_sha256"], pair_digest(canonical, &baseline, &media));
+            let metadata = public_metadata(&queue).unwrap();
+            let response = serde_json::json!([{"source":"Bandcamp","ticket":"f".repeat(32),
+                "sha256":media,"proof_catalog_id":old,"pair_sha256":pair_digest(old, &baseline, &media)}]);
+            let hit = lookup_known(canonical, canonical, metadata.clone(), |body| {
+                assert_eq!(body["include_aliases"], true);
+                assert_eq!(body["catalog_id"], canonical);
+                Ok(json_response(200, &response))
+            }).unwrap();
+            assert_eq!(hit.proof_id(), Some(old));
+            let playing = make(canonical, canonical);
+            assert!(same_proof_recording(&playing, old, |ids| {
+                assert_eq!(ids, [canonical, old]);
+                Ok(vec![queue.clone(), playing.clone()])
+            }));
+            assert!(hit.matches(old, &baseline));
+            assert!(!hit.matches(canonical, &baseline));
+            assert!(!hit.matches(old, &"c".repeat(64)));
+            let other_edition = make(old, "555");
+            assert!(!same_proof_recording(&playing, old, |_| Ok(vec![playing.clone(), other_edition])));
+            assert!(!same_proof_recording(&playing, old, |_| Ok(vec![playing.clone()])));
+            assert!(same_proof_recording(&playing, canonical, |_| panic!("exact ID does not need a lookup")));
+            assert!(!same_proof_recording(&playing, "0001", |_| panic!("invalid id")));
+            for bad in [serde_json::json!("008"), serde_json::json!("https://other"), serde_json::json!(8), serde_json::Value::Null] {
+                let mut invalid = response.clone();
+                invalid[0]["proof_catalog_id"] = bad;
+                assert!(lookup_known(canonical, canonical, metadata.clone(), |_| Ok(json_response(200, &invalid))).is_none());
+            }
+            assert_eq!(make(old, "a-private-recording").catalog_id(), old);
+        }
+    }
+
+    #[test]
+    fn older_service_recovers_an_exact_queue_id_receipt_after_a_canonical_miss() {
+        let metadata = serde_json::json!({"title":"song","artists":["Artist"],"duration_ms":120000});
+        let response = serde_json::json!([{"source":"Yandex Music","ticket":"a".repeat(32),
+            "sha256":"a".repeat(64),"pair_sha256":"b".repeat(64)}]);
+        let mut attempts = Vec::new();
+        let hit = lookup_known("148716915", "57878398", metadata, |body| {
+            attempts.push(body.clone());
+            Ok(if body.get("include_aliases").is_some() { json_response(400, &serde_json::Value::Null) }
+                else if body["catalog_id"] == "57878398" { json_response(200, &response) }
+                else { json_response(200, &serde_json::json!([])) })
+        }).unwrap();
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(hit.proof_id(), Some("57878398"));
     }
 
     #[test]
