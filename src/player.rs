@@ -475,7 +475,8 @@ fn verified_known(
     let proof = hit.proof_id()?;
     if !current() || !found() { return None; }
     if !originals::same_proof_recording(track, proof, |ids| api.tracks(ids)) || !current() { return None; }
-    let media = originals::known_audio(&hit, proof, token, current, |alternative| {
+    let refresh = || originals::known_candidate(track, &token, current);
+    let media = originals::known_audio(&hit, proof, &token, current, refresh, |alternative| {
         let public = api.tracks(&[alternative.into()]).ok()?.into_iter()
             .any(|t| t.id == alternative && t.catalog_id() != track.catalog_id() && originals::can_match(&t));
         if !public || !current() { return None; }

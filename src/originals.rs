@@ -392,31 +392,56 @@ pub struct ExternalAudio {
     token: String,
 }
 
-fn fetch_audio(candidate: &OnlineCandidate, token: String, cached: Option<std::sync::Arc<crate::stream::Buf>>, timeout: Duration, current: &impl Fn() -> bool) -> Res<ExternalAudio> {
-    if !current() { return Err("Выбор трека изменился".into()); }
-    let mut request = resolver_login::signed("GET", &format!("/audio/{}", candidate.ticket), &token, vec![])?;
+#[derive(Debug, PartialEq)]
+enum AudioError { Transport, Busy, Denied, MissingTicket, DigestMismatch, Rejected }
+
+impl AudioError {
+    fn retryable(&self) -> bool { matches!(self, Self::Transport | Self::Busy) }
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Transport => "обрыв соединения",
+            Self::Busy => "сервис временно недоступен",
+            Self::Denied => "доступ отклонён",
+            Self::MissingTicket => "билет недоступен",
+            Self::DigestMismatch => "хеш аудио не совпал",
+            Self::Rejected => "ответ отклонён",
+        }
+    }
+}
+
+fn fetch_audio(candidate: &OnlineCandidate, token: String, cached: Option<std::sync::Arc<crate::stream::Buf>>, timeout: Duration, current: &impl Fn() -> bool) -> Result<ExternalAudio, AudioError> {
+    if !current() { return Err(AudioError::Rejected); }
+    let mut request = resolver_login::signed("GET", &format!("/audio/{}", candidate.ticket), &token, vec![]).map_err(|_| AudioError::Rejected)?;
     if cached.is_some() {
         request = request.header("If-None-Match", format!("\"{}\"", candidate.sha256.as_deref().unwrap_or_default()));
     }
-    let response = request.timeout(timeout).send().map_err(|e| e.to_string())?;
+    let response = request.timeout(timeout).send().map_err(|error| {
+        if error.is_timeout() || error.is_connect() || error.is_request() || error.is_body() { AudioError::Transport } else { AudioError::Rejected }
+    })?;
     let reused = response.status() == reqwest::StatusCode::NOT_MODIFIED;
     let buf = ticket_audio(response, candidate.sha256.as_deref(), cached, current)?;
     Ok(ExternalAudio { buf, format: "MP3".into(), cached: reused, token })
 }
 
-fn ticket_audio(response: reqwest::blocking::Response, expected: Option<&str>, cached: Option<std::sync::Arc<crate::stream::Buf>>, current: &impl Fn() -> bool) -> Res<std::sync::Arc<crate::stream::Buf>> {
+fn ticket_audio(response: reqwest::blocking::Response, expected: Option<&str>, cached: Option<std::sync::Arc<crate::stream::Buf>>, current: &impl Fn() -> bool) -> Result<std::sync::Arc<crate::stream::Buf>, AudioError> {
     match response.status() {
-        reqwest::StatusCode::NOT_MODIFIED => cached.ok_or_else(|| "Нет подтверждённой копии".into()),
+        reqwest::StatusCode::NOT_MODIFIED => cached.ok_or(AudioError::Rejected),
         reqwest::StatusCode::OK => {
-            let buf = crate::stream::Buf::from_media(response, current).map_err(|e| e.to_string())?;
+            let buf = crate::stream::Buf::from_media(response, current).map_err(|e| match e.kind() {
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionAborted => AudioError::Transport,
+                _ => AudioError::Rejected,
+            })?;
             if let Some(expected) = expected {
                 if !digest_valid(expected) || confirmed_audio::digest(buf.reader()).ok().as_deref() != Some(expected) {
-                    return Err("Аудио отличается от выданного сервером".into());
+                    return Err(AudioError::DigestMismatch);
                 }
             }
             Ok(buf)
         }
-        status => Err(format!("Сервер аудио вернул {status}")),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => Err(AudioError::Denied),
+        reqwest::StatusCode::NOT_FOUND => Err(AudioError::MissingTicket),
+        reqwest::StatusCode::BAD_GATEWAY | reqwest::StatusCode::SERVICE_UNAVAILABLE | reqwest::StatusCode::GATEWAY_TIMEOUT => Err(AudioError::Busy),
+        _ => Err(AudioError::Rejected),
     }
 }
 
@@ -436,8 +461,31 @@ fn catalog_ticket_audio(
     (complete_digest(&buf, current)?.as_str() == expected).then_some((buf, format))
 }
 
+fn deliver_known<T>(
+    hit: &KnownCandidate, current: &impl Fn() -> bool, refresh: impl FnOnce() -> Option<KnownCandidate>,
+    mut fetch: impl FnMut(&OnlineCandidate) -> Result<T, AudioError>,
+) -> Option<T> {
+    if !current() { return None; }
+    match fetch(&hit.candidate) {
+        Ok(audio) => return Some(audio),
+        Err(e) if e.retryable() && current() => crate::config::log(format!("Доставка проверенной версии: {}, повтор с новым билетом", e.label())),
+        Err(e) => {
+            if current() { crate::config::log(format!("Доставка проверенной версии: {}", e.label())); }
+            return None;
+        }
+    }
+    let next = refresh()?;
+    if !current() || next.candidate.ticket == hit.candidate.ticket || next.candidate.source != hit.candidate.source
+        || next.candidate.sha256 != hit.candidate.sha256 || next.proof_catalog_id != hit.proof_catalog_id
+        || next.baseline_sha256 != hit.baseline_sha256 || next.baseline_sha256s != hit.baseline_sha256s
+        || next.pair_sha256 != hit.pair_sha256 { return None; }
+    fetch(&next.candidate).inspect_err(|e| {
+        if current() { crate::config::log(format!("Повторная доставка проверенной версии: {}", e.label())); }
+    }).ok()
+}
+
 pub fn known_audio(
-    hit: &KnownCandidate, track: &str, token: String, current: &impl Fn() -> bool,
+    hit: &KnownCandidate, track: &str, token: &str, current: &impl Fn() -> bool, refresh: impl FnOnce() -> Option<KnownCandidate>,
     load_catalog: impl FnOnce(&str) -> Option<(std::sync::Arc<crate::stream::Buf>, String)>,
 ) -> Option<ExternalAudio> {
     let media = hit.candidate.sha256.as_deref()?;
@@ -445,15 +493,17 @@ pub fn known_audio(
     if hit.is_yandex() {
         if !current() { return None; }
         let path = format!("/catalog/{}", hit.candidate.ticket);
-        let response = resolver_login::signed("GET", &path, &token, vec![]).ok()?
+        let response = resolver_login::signed("GET", &path, token, vec![]).ok()?
             .timeout(Duration::from_secs(4)).send().ok()?;
         let (buf, format) = catalog_ticket_audio(response, track, media, current, load_catalog)?;
-        return Some(ExternalAudio { buf, format, cached: false, token });
+        return Some(ExternalAudio { buf, format, cached: false, token: token.into() });
     }
-    let cached = cached_audio(&token, track, media, &pair, hit.baseline_sha256.as_deref()).or_else(|| {
-        hit.baseline_sha256s.iter().find_map(|s| cached_audio(&token, track, media, &pair_digest(track, s, media), Some(s)))
+    let cached = cached_audio(token, track, media, &pair, hit.baseline_sha256.as_deref()).or_else(|| {
+        hit.baseline_sha256s.iter().find_map(|s| cached_audio(token, track, media, &pair_digest(track, s, media), Some(s)))
     });
-    fetch_audio(&hit.candidate, token, cached, Duration::from_secs(15), current).ok()
+    // First-buffer waiting has its own short deadline. Finish an already matched
+    // download in the background even when a slow link takes more than 15 seconds.
+    deliver_known(hit, current, refresh, |ticket| fetch_audio(ticket, token.into(), cached.clone(), Duration::from_secs(48), current))
 }
 
 pub fn cache_known(hit: &KnownCandidate, track: &str, audio: &ExternalAudio) {
@@ -472,7 +522,7 @@ pub fn online_audio(candidate: &OnlineCandidate, track: &Track, original: Option
         let read = |id| cached_audio(&token, id, media, &pair_digest(id, baseline, media), Some(baseline));
         read(track.catalog_id()).or_else(|| if track.catalog_id() != track.id { read(&track.id) } else { None })
     });
-    fetch_audio(candidate, token, cached, Duration::from_secs(48), current)
+    fetch_audio(candidate, token, cached, Duration::from_secs(48), current).map_err(|e| e.label().into())
 }
 
 fn catalog_confirmation(track: &Track, alternative: &str, baseline: &str, media: &str) -> Option<serde_json::Value> {
@@ -702,6 +752,48 @@ mod tests {
             assert_ne!(public_metadata(&other).unwrap()["title"], "днк");
             assert!(catalog_candidates(&clean, &[other]).is_empty());
         }
+    }
+
+    #[test]
+    fn known_delivery_retries_transient_errors_once_with_a_fresh_ticket_for_the_same_proof() {
+        let digest = media_digest(b"verified".as_slice()).unwrap();
+        let make = |ticket: &str, pair: &str| serde_json::from_value::<KnownCandidate>(serde_json::json!({
+            "source":"Bandcamp","ticket":ticket.repeat(32),"sha256":digest,"pair_sha256":pair.repeat(64),"proof_catalog_id":"7"
+        })).unwrap();
+        let old = make("1", "a");
+        let body = |status, declared, data: &[u8]| tungstenite::http::Response::builder().status(status)
+            .header("content-length", declared).body(data.to_vec()).unwrap().into();
+        for first in [body(502,0,b""), body(503,0,b""), body(504,0,b""), body(200,8,b"cut")] {
+            let mut first = Some(first);
+            let mut issued = vec![];
+            let buf = deliver_known(&old, &|| true, || Some(make("2", "a")), |ticket| {
+                issued.push(ticket.ticket.clone());
+                ticket_audio(first.take().unwrap_or_else(|| body(200,8,b"verified")), Some(&digest), None, &|| true)
+            }).unwrap();
+            assert_eq!(issued, ["1".repeat(32), "2".repeat(32)]);
+            assert_eq!(media_digest(buf.reader()).unwrap(), digest);
+        }
+        for refusal in [body(401,0,b""), body(403,0,b""), body(404,0,b""), body(500,0,b""), body(304,0,b""), body(200,8,b"tampered")] {
+            let mut response = Some(refusal);
+            assert!(deliver_known(&old, &|| true, || panic!("terminal refusal"), |_| {
+                ticket_audio(response.take().unwrap(), Some(&digest), None, &|| true)
+            }).is_none());
+        }
+        assert!(deliver_known(&old, &|| false, || panic!("cancelled owner"), |_| Err::<(),_>(AudioError::Transport)).is_none());
+        for replacement in [make("1", "a"), make("2", "b")] {
+            let mut attempts = 0;
+            assert!(deliver_known(&old, &|| true, || Some(replacement), |_| {
+                attempts += 1;
+                Err::<(),_>(AudioError::Busy)
+            }).is_none());
+            assert_eq!(attempts, 1);
+        }
+        let mut attempts = 0;
+        assert!(deliver_known(&old, &|| true, || Some(make("2", "a")), |_| {
+            attempts += 1;
+            Err::<(),_>(AudioError::Busy)
+        }).is_none());
+        assert_eq!(attempts, 2);
     }
 
     #[test]

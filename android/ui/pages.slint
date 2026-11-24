@@ -1540,7 +1540,7 @@ export component MiniPlayer inherits Rectangle {
     TouchArea {
         clicked => { root.open(); }
     }
-    if Now.audio-format != "": AudioVersionIndicator {
+    if Now.audio-format != "" && root.width >= 162px: AudioVersionIndicator {
         x: 30px;
         y: 26px;
         width: 32px;
