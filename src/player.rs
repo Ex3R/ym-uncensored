@@ -2317,7 +2317,7 @@ mod tests {
             if std::env::var_os("YM_TEST_OFFLINE_SOURCES").is_some() {
                 assert!(resolve_track(&api,&t,buf.clone(),&|| true,&retry).is_none());
                 assert!(retry.get());
-                assert!(baseline.take(44100).any(|sample| sample.abs() > 0.001));
+                assert!(baseline.take(44100).any(|sample| sample.unsigned_abs() > 32));
                 eprintln!("original {id} decoded after source connection failed");
                 continue;
             }
