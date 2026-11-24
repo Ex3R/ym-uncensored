@@ -55,6 +55,8 @@ pub struct Track {
     /// Ревизия и серверная позиция строки, выбранной пользователем.
     playlist_slot: Option<Box<PlaylistSlot>>,
     pub id: String,
+    /// Yandex recording identity. The queue, feedback and library always use the original id.
+    real_id: Option<String>,
     pub user_upload: bool,
     pub album_id: Option<String>,
     pub title: String,
@@ -86,7 +88,13 @@ pub struct Mood {
     pub energy: f32,
 }
 
+pub(crate) fn public_catalog_id(id: &str) -> bool {
+    (1..=20).contains(&id.len()) && !id.starts_with('0') && id.bytes().all(|b| b.is_ascii_digit())
+}
+
 impl Track {
+    pub fn catalog_id(&self) -> &str { self.real_id.as_deref().unwrap_or(&self.id) }
+
     /// Тот же трек, но не привязанный к строке показанного плейлиста.
     pub fn detached(mut self) -> Self {
         self.playlist_slot = None;
@@ -376,6 +384,7 @@ pub(crate) fn parse_track(v: &Value) -> Option<Track> {
     let flag = |k: &str| li.and_then(|l| l.get(k)).and_then(|x| x.as_bool()).unwrap_or(false);
     Some(Track {
         playlist_slot: None,
+        real_id: s(v.get("realId")).filter(|id| public_catalog_id(id)),
         id,
         user_upload: v.get("trackSource").and_then(Value::as_str).is_some_and(|s| s.eq_ignore_ascii_case("UGC"))
             || v.get("ugcArtistName").is_some_and(|name| !name.is_null()),
@@ -388,7 +397,8 @@ pub(crate) fn parse_track(v: &Value) -> Option<Track> {
         cover: v.get("coverUri").and_then(|c| c.as_str()).map(String::from),
         explicit: v.get("contentWarning").and_then(|c| c.as_str()) == Some("explicit")
             || v.get("explicit").and_then(|c| c.as_bool()).unwrap_or(false),
-        lyrics: flag("hasAvailableSyncLyrics") || flag("hasAvailableTextLyrics"),
+        lyrics: flag("hasAvailableSyncLyrics") || flag("hasAvailableTextLyrics")
+            || v.get("lyricsAvailable").and_then(Value::as_bool) == Some(true),
         color: hex_color(v.pointer("/derivedColors/average")),
         album_title: album.map(|a| str_of(a, "title")).unwrap_or_default(),
         year: album.and_then(|a| a.get("year")).and_then(|y| y.as_u64()).map(|y| y as u32),
@@ -1752,7 +1762,7 @@ impl Api {
                 // Синхронного текста нет у многих треков — тогда берётся обычный.
                 Err(_) if format == "LRC" => continue,
                 // 404 — у трека нет текста вообще: это не ошибка, показываем пустой.
-                Err(e) if e.starts_with("HTTP 404") => return Ok(out),
+                Err(e) if e.starts_with("HTTP 404") => break,
                 Err(e) => return Err(e),
             };
             let url = v.get("downloadUrl").and_then(|u| u.as_str()).ok_or("нет ссылки на текст")?;
@@ -1773,6 +1783,20 @@ impl Api {
                 }
             } else {
                 out.text = text.lines().map(|l| l.trim_end().to_string()).collect();
+            }
+        }
+        if out.text.is_empty() && out.synced.is_empty() && !track_id.is_empty()
+            && track_id.len() <= 20 && track_id.bytes().all(|b| b.is_ascii_digit())
+        {
+            let request = self.req(Method::GET, &format!("/tracks/{track_id}/supplement"));
+            match self.send(bounded(request)?) {
+                Ok(data) => {
+                    if let Some(text) = data.pointer("/lyrics/fullLyrics").and_then(Value::as_str) {
+                        out.text = text.lines().map(str::trim_end).map(str::to_owned).collect();
+                    }
+                }
+                Err(e) if e.starts_with("HTTP 404") => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(out)

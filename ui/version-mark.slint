@@ -1,0 +1,30 @@
+// Status of the selected audio buffer. Shape distinguishes the three states without colour.
+export component VersionMark inherits Rectangle {
+    in property <int> status;
+    in property <string> label;
+    in property <brush> ink: #fff;
+    accessible-role: image;
+    accessible-label: root.label;
+    width: 16px;
+    height: 16px;
+    border-radius: self.height / 2;
+    border-width: 1.4px;
+    border-color: root.ink;
+    if status == 0: Text {
+        accessible-role: none;
+        text: "?";
+        font-size: root.height * 0.72;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        color: root.ink;
+    }
+    if status != 0: Path {
+        width: root.width; height: root.height;
+        viewbox-width: 16; viewbox-height: 16;
+        fill: transparent;
+        stroke: root.ink;
+        stroke-width: 1.7px;
+        commands: root.status == 2 ? "M3.7 8.0 L6.7 10.8 L12.2 5.1" : "M4.2 8 L11.8 8";
+    }
+}

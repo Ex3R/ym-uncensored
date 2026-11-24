@@ -1,5 +1,7 @@
 // Общее для экранов: иконки из APK оригинала, данные плеера и мелкие кнопки.
 
+import { VersionMark } from "../../ui/version-mark.slint";
+
 export struct Icons {
     logo: image,
     search: image,
@@ -84,6 +86,10 @@ export global Now {
     in property <image> avatar;
     in property <image> cutout;
     in property <color> bg: #1f1f1f;
+    in property <string> audio-format;
+    in property <int> audio-version;
+    in property <string> audio-version-label;
+    callback explain-audio-version(string);
     in property <bool> playing;
     in property <bool> loading;
     in property <bool> liked;
@@ -133,6 +139,43 @@ export global Now {
     // Что играет вместо обычной волны: плейлист, альбом, вайб. Пусто — обычная волна.
     in property <string> pill;
     callback back-to-wave();
+}
+
+export component AudioVersionIndicator inherits Rectangle {
+    in property <bool> with-codec;
+    in property <color> tint: #fff;
+    accessible-role: button;
+    accessible-label: Now.audio-version-label;
+    accessible-action-default => { Now.explain-audio-version(Now.audio-version-label); }
+    if !root.with-codec: Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 21px;
+        height: 21px;
+        border-radius: 11px;
+        background: #202124;
+    }
+    HorizontalLayout {
+        alignment: center;
+        spacing: 4px;
+        if root.with-codec: Text {
+            text: Now.audio-format;
+            color: root.tint;
+            vertical-alignment: center;
+            font-size: 12px;
+        }
+        VersionMark {
+            y: (parent.height - self.height) / 2;
+            width: 16px;
+            height: 16px;
+            status: Now.audio-version;
+            label: Now.audio-version-label;
+            ink: root.tint;
+        }
+    }
+    TouchArea {
+        clicked => { Now.explain-audio-version(Now.audio-version-label); }
+    }
 }
 
 export component IconButton inherits Rectangle {

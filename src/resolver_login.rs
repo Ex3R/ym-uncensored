@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 
 pub const BASE: &str = "https://ym.idkroma.ru/api/uncensored/v1";
 const NAME: &str = "external-sources";
-static STATE: Mutex<State> = Mutex::new(State { pending: false, generation: 0 });
+static STATE: Mutex<State> = Mutex::new(State { pending: false, generation: 0, checked_revision: None });
 
 struct State {
     pending: bool,
     generation: u64,
+    checked_revision: Option<u64>,
 }
 
 pub fn http() -> Result<reqwest::blocking::Client, String> {
@@ -39,7 +40,21 @@ pub(crate) fn session_revision() -> u64 {
     SESSION_REVISION.load(std::sync::atomic::Ordering::Acquire)
 }
 
+static MODE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn mode_enabled() -> bool { MODE_ENABLED.load(std::sync::atomic::Ordering::Acquire) }
+
+pub fn set_mode_enabled(enabled: bool) {
+    let old = MODE_ENABLED.swap(enabled, std::sync::atomic::Ordering::AcqRel);
+    if old && !enabled { disconnect(); }
+}
+
 pub fn credential() -> Option<String> {
+    if !mode_enabled() { return None; }
+    saved_credential()
+}
+
+fn saved_credential() -> Option<String> {
     let value = std::fs::read_to_string(crate::config::dir().join(NAME)).ok()?;
     let token = if cfg!(any(target_os = "linux", target_os = "android")) && valid(&value) {
         Some(value)
@@ -102,14 +117,44 @@ pub fn signed(method: &str, path: &str, token: &str, body: Vec<u8>) -> Result<re
         .header("Content-Type","application/octet-stream").body(body))
 }
 
-pub fn disconnect() {
+/// Check an existing installation grant once per session. Network failures leave it usable.
+pub fn check_saved_session(expired: impl FnOnce() + Send + 'static) {
     let mut state = STATE.lock().unwrap();
+    let revision = session_revision();
+    if !mode_enabled() || state.checked_revision == Some(revision) { return; }
+    state.checked_revision = Some(revision);
+    drop(state);
+    std::thread::spawn(move || {
+        let Some(token) = credential() else { return };
+        if session_revision() != revision { return; }
+        let Ok(request) = signed("GET", "/auth/status", &token, vec![]) else { return };
+        let Ok(response) = request.send() else { return };
+        if !grant_rejected(response.status()) { return; }
+        let mut state = STATE.lock().unwrap();
+        if session_revision() != revision || credential().as_deref() != Some(&token) { return; }
+        clear_grant(&mut state);
+        drop(state);
+        expired();
+    });
+}
+
+fn grant_rejected(status: reqwest::StatusCode) -> bool {
+    matches!(status, reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::GONE)
+}
+
+fn clear_grant(state: &mut State) {
     state.generation = state.generation.wrapping_add(1);
     state.pending = false;
-    let token = credential();
     let _ = std::fs::remove_file(crate::config::dir().join(NAME));
     crate::secret::forget(NAME);
     SESSION_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+pub fn disconnect() {
+    let mut state = STATE.lock().unwrap();
+    let token = saved_credential();
+    clear_grant(&mut state);
+    drop(state);
     if let Some(token) = token {
         std::thread::spawn(move || {
             if let Ok(request) = signed("POST", "/auth/logout", &token, vec![]) { let _ = request.send(); }
@@ -117,9 +162,15 @@ pub fn disconnect() {
     }
 }
 
+pub fn cancel_pending() {
+    let mut state = STATE.lock().unwrap();
+    state.generation = state.generation.wrapping_add(1);
+    state.pending = false;
+}
+
 pub fn connect(done: impl FnOnce(Result<(), String>) + Send + 'static) {
     let mut state = STATE.lock().unwrap();
-    if state.pending { return; }
+    if state.pending || !mode_enabled() { return; }
     state.pending = true;
     let generation = state.generation;
     std::thread::spawn(move || {
@@ -136,18 +187,31 @@ pub fn connect(done: impl FnOnce(Result<(), String>) + Send + 'static) {
 #[derive(serde::Deserialize)]
 struct Pairing { token: String, link: String }
 
+pub(crate) fn open_pairing_if_current(link: &str, generation: u64) -> bool {
+    let state = STATE.lock().unwrap();
+    if !state.pending || state.generation != generation || !mode_enabled() { return false; }
+    #[cfg(target_os="android")]
+    { crate::sys::open_sources_login(link) }
+    #[cfg(not(target_os="android"))]
+    { crate::sys::open_url(link); true }
+}
+
 fn authorize(generation: u64) -> Result<(), String> {
     let body = serde_json::to_vec(&serde_json::json!({"public_key":hex(install_key()?.public_key().as_ref())})).map_err(|e| e.to_string())?;
     let pair = signed("POST", "/auth/start", "", body)?.send().and_then(|r| r.error_for_status())
         .and_then(|r| r.json::<Pairing>()).map_err(|_| "Сервис входа недоступен")?;
     if !valid(&pair.token) || !pair.link.starts_with(&format!("{BASE}/auth/browser?")) { return Err("Неверный ответ сервиса".into()); }
-    crate::sys::open_url(&pair.link);
+    #[cfg(target_os="android")]
+    let opened = open_pairing_if_current(&pair.link, generation);
+    #[cfg(not(target_os="android"))]
+    let opened = crate::gui::open_sources_browser(pair.link, generation);
+    if !opened { return Err("Вход не открыт. Его можно повторить в настройках плеера".into()); }
     let deadline = Instant::now() + Duration::from_secs(600);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_secs(3));
         if STATE.lock().unwrap().generation != generation { return Err("Вход отменён".into()); }
         if let Ok(r) = signed("GET", "/auth/status", &pair.token, vec![])?.send() {
-            if matches!(r.status(), reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::GONE) {
+            if grant_rejected(r.status()) {
                 return Err("Подключение отменено. Можно пользоваться обычным плеером".into());
             }
             if r.status() == reqwest::StatusCode::NO_CONTENT {

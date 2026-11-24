@@ -5,7 +5,7 @@ use crate::config::{log, Config, CROSSFADE_SECS};
 use crate::player::{Cmd, Player};
 use crate::{eq, original, sys, update, App, Prof, T};
 use slint::{ComponentHandle, Image, Model, ModelRc, SharedPixelBuffer, SharedString, VecModel};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
@@ -15,19 +15,48 @@ const SUPPORT_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/issues");
 thread_local! {
     static API: RefCell<Option<Arc<Api>>> = const { RefCell::new(None) };
     static RELEASE_PAGE: RefCell<String> = const { RefCell::new(String::new()) };
+    static SOURCES_ATTEMPT: Cell<u64> = const { Cell::new(0) };
 }
 
-pub(crate) fn connect_sources(ui: &App) {
+pub(crate) fn connect_sources(ui: &App, retry: bool) {
+    if !ui.get_logged_in() || !crate::is_resumed() || !ui.window().is_visible() { return; }
     let mut cfg = Config::load();
-    cfg.sources_setup = Some(true);
-    cfg.save();
-    ui.set_sources_requested(true);
+    let connected = crate::resolver_login::credential().is_some();
+    let prof = ui.global::<Prof>();
+    prof.set_sources_connected(connected);
+    if connected {
+        let weak = ui.as_weak();
+        crate::resolver_login::check_saved_session(move || {
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = weak.upgrade() else { return };
+                if !ui.get_logged_in() || !crate::resolver_login::mode_enabled() || crate::resolver_login::credential().is_some() { return; }
+                let p = ui.global::<Prof>();
+                p.set_sources_connected(false);
+                p.set_sources_error("Срок входа истёк".into());
+                connect_sources(&ui, false);
+            });
+        });
+        return;
+    }
+    if !cfg.begin_sources_login(true, connected, retry) { return; }
+    let attempt = SOURCES_ATTEMPT.with(|id| { id.set(id.get().wrapping_add(1)); id.get() });
+    prof.set_sources_attempted(true);
+    prof.set_sources_pending(true);
+    prof.set_sources_error("".into());
     let weak = ui.as_weak();
     crate::resolver_login::connect(move |result| {
+        let revision = crate::resolver_login::session_revision();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = weak.upgrade() {
-                ui.global::<Prof>().set_sources_connected(result.is_ok());
-                crate::toast(result.err().unwrap_or_else(|| "Внешние источники подключены".into()));
+                if !ui.get_logged_in() || !crate::resolver_login::mode_enabled() ||
+                    revision != crate::resolver_login::session_revision() || SOURCES_ATTEMPT.with(Cell::get) != attempt { return; }
+                let p = ui.global::<Prof>();
+                p.set_sources_pending(false);
+                p.set_sources_connected(crate::resolver_login::credential().is_some());
+                if let Err(error) = result {
+                    p.set_sources_error(error.as_str().into());
+                    crate::toast(format!("{error}. Повторить вход можно в настройках"));
+                }
             }
         });
     });
@@ -64,6 +93,26 @@ pub fn bind(ui: &App, player: &Player) {
     p.set_wave_motion(c.wave_motion);
     p.set_crossfade(c.crossfade_secs > 0);
     p.set_sources_connected(crate::resolver_login::credential().is_some());
+    p.set_ordinary_only(!c.uncensor_enabled());
+    p.set_sources_attempted(c.sources_login_attempted);
+    let (weak, pl) = (ui.as_weak(), player.clone());
+    p.on_set_ordinary_only(move |ordinary| {
+        let Some(ui) = weak.upgrade() else { return };
+        let mut cfg = Config::load();
+        cfg.set_uncensor_enabled(!ordinary);
+        let p = ui.global::<Prof>();
+        p.set_ordinary_only(ordinary);
+        p.set_sources_attempted(false);
+        p.set_sources_pending(false);
+        p.set_sources_error("".into());
+        p.set_sources_connected(crate::resolver_login::credential().is_some());
+        pl.send(Cmd::SourcesModeChanged);
+        if !ordinary { connect_sources(&ui, false); }
+    });
+    let weak = ui.as_weak();
+    p.on_retry_sources(move || {
+        if let Some(ui) = weak.upgrade() { connect_sources(&ui, true); }
+    });
     p.set_updates(c.check_updates);
     p.set_eq_on(c.eq_on);
     p.set_eq_preset(c.eq_preset.min(eq::PRESETS.len() - 1) as i32);
@@ -167,20 +216,7 @@ pub fn bind(ui: &App, player: &Player) {
         c.save();
     });
 
-    let settings_ui = ui.as_weak();
     p.on_link(move |id| {
-        if id == "external-sources" {
-            if crate::resolver_login::credential().is_some() {
-                let mut cfg = Config::load();
-                cfg.sources_setup = Some(false);
-                cfg.save();
-                crate::resolver_login::disconnect();
-                if let Some(ui) = settings_ui.upgrade() { ui.global::<Prof>().set_sources_connected(false); ui.set_sources_requested(false); }
-            } else {
-                if let Some(ui) = settings_ui.upgrade() { connect_sources(&ui); }
-            }
-            return;
-        }
         let url = match id.as_str() {
             "plus" => "https://plus.yandex.ru/my".to_string(),
             "support" => SUPPORT_URL.into(),

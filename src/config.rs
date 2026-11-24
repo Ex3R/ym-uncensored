@@ -56,7 +56,9 @@ pub struct Config {
     pub check_updates: bool,
     /// «Треки 18+» в меню профиля.
     pub allow_explicit: bool,
+    // Older releases saved an explicit opt-out here. Missing means uncensor is enabled.
     pub sources_setup: Option<bool>,
+    pub sources_login_attempted: bool,
     /// Добавлять треки в конец плейлиста, а не в начало.
     pub add_to_end: bool,
     /// Пятно «Моей волны» движется. Выключено: анимация всё время тратит процессор.
@@ -107,6 +109,7 @@ impl Default for Config {
             check_updates: true,
             allow_explicit: true,
             sources_setup: None,
+            sources_login_attempted: false,
             add_to_end: false,
             wave_motion: false,
             crossfade_secs: 0,
@@ -145,6 +148,28 @@ fn plaintext_fallback(allow: bool, token: &Option<String>, sealed: &Option<Strin
 }
 
 impl Config {
+    pub fn uncensor_enabled(&self) -> bool { self.sources_setup != Some(false) }
+
+    pub fn set_uncensor_enabled(&mut self, enabled: bool) {
+        self.sources_setup = Some(enabled);
+        self.sources_login_attempted = false;
+        crate::resolver_login::set_mode_enabled(enabled);
+        self.save();
+    }
+
+    fn needs_sources_login(&self, visible: bool, connected: bool, retry: bool) -> bool {
+        self.uncensor_enabled() && self.token.is_some() && visible && !connected && (retry || !self.sources_login_attempted)
+    }
+
+    pub fn begin_sources_login(&mut self, visible: bool, connected: bool, retry: bool) -> bool {
+        if !self.needs_sources_login(visible, connected, retry) { return false; }
+        if retry { crate::resolver_login::cancel_pending(); }
+        // Also remember cancellation, a closed browser, and an interrupted process across relaunches.
+        self.sources_login_attempted = true;
+        self.save();
+        true
+    }
+
     /// Длина кроссфейда.
     pub fn crossfade(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.crossfade_secs.into())
@@ -205,6 +230,7 @@ impl Config {
 
     /// Выход или токен отозван: убрать и из памяти, и с диска.
     pub fn forget_token(&mut self) {
+        self.sources_login_attempted = false;
         self.token = None;
         self.token_sealed = None;
         crate::secret::forget("token");
@@ -275,7 +301,28 @@ pub fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::plaintext_fallback;
+    use super::{Config, plaintext_fallback};
+
+    #[test]
+    fn uncensor_upgrades_respect_opt_out_and_attempt_login_once_when_visible() {
+        let mut fresh: Config = serde_json::from_str("{}").unwrap();
+        assert!(fresh.uncensor_enabled());
+        assert!(!fresh.needs_sources_login(true, false, false));
+        fresh.token = Some("music".into());
+        assert!(!fresh.needs_sources_login(false, false, false));
+        assert!(fresh.needs_sources_login(true, false, false));
+        assert!(!fresh.needs_sources_login(true, true, false));
+        fresh.sources_login_attempted = true;
+        let mut restored: Config = serde_json::from_value(serde_json::to_value(fresh).unwrap()).unwrap();
+        restored.token = Some("music".into());
+        assert!(!restored.needs_sources_login(true, false, false));
+        assert!(restored.needs_sources_login(true, false, true));
+        assert!(!restored.needs_sources_login(true, true, true));
+        let mut old: Config = serde_json::from_str(r#"{"sources_setup":false}"#).unwrap();
+        old.token = Some("music".into());
+        assert!(!old.uncensor_enabled());
+        assert!(!old.needs_sources_login(true, false, true));
+    }
 
     #[test]
     fn update_notifications_migrate_and_remember_opt_out() {

@@ -1,7 +1,7 @@
 // Полный плеер, как в мобильном клиенте: обложка или текст, кнопки, исполнитель, похожие
 // треки, плейлисты, таймер и звук. Координаты в dp сняты с оригинала на экране 411 dp.
 
-import { Now, IconButton, SkipIcon, DeviceIcon, CollapseIcon, Cover, TrackRow, T } from "common.slint";
+import { Now, AudioVersionIndicator, IconButton, SkipIcon, DeviceIcon, CollapseIcon, Cover, TrackRow, T } from "common.slint";
 import { LoadingPulse } from "../../ui/loading-pulse.slint";
 
 /// Кнопка 72×48 под плеером: повтор, текст, таймер, звук.
@@ -112,6 +112,12 @@ export component MiniPlayer inherits Rectangle {
         font-size: 14px;
         overflow: elide;
     }
+    if Now.audio-format != "" && root.width >= 150px: AudioVersionIndicator {
+        x: 25px;
+        y: 22px;
+        width: 32px;
+        height: 32px;
+    }
     IconButton {
         x: parent.width - 90px;
         y: 4px;
@@ -158,6 +164,7 @@ export component Player inherits Rectangle {
     property <length> controls-y: root.split ? max(root.art-y, root.art-y + (root.art-size - 300px) / 2) : root.art-y + root.art-size;
     property <length> base: root.split ? max(root.controls-y, root.art-y + root.art-size - 298px) : root.controls-y;
     property <length> header-y: root.split ? 20px : T.top;
+    property <bool> header-version: Now.audio-format != "" && root.width >= 220px && !root.queue-open && !root.lyrics-full;
     property <length> queue-y: root.header-y + 48px;
     property <length> lyrics-width: min(root.width - 48px, 720px);
     property <length> lyrics-y: root.split ? 76px : 112px;
@@ -872,13 +879,23 @@ export component Player inherits Rectangle {
         }
     }
     Text {
-        y: root.header-y + 15px;
-        width: root.width;
+        x: 48px;
+        y: root.header-y + (root.header-version ? 3px : 15px);
+        width: max(0px, root.width - 144px);
         text: Now.source;
+        overflow: elide;
         color: #ffffffe6;
         font-size: 14px;
         font-weight: 500;
         horizontal-alignment: center;
+    }
+    if root.header-version: AudioVersionIndicator {
+        x: 48px;
+        y: root.header-y + 22px;
+        width: root.width - 144px;
+        height: 26px;
+        with-codec: true;
+        tint: #ffffffcc;
     }
     Rectangle {
         x: 327.6px - 12px + root.width - 411.4px;

@@ -28,6 +28,12 @@ export global Prof {
     in property <string> version;
     in property <string> update;
     in property <bool> sources-connected;
+    in property <bool> ordinary-only;
+    in property <bool> sources-attempted;
+    in property <bool> sources-pending;
+    in property <string> sources-error;
+    callback set-ordinary-only(bool);
+    callback retry-sources();
     callback changed();
     callback less-ai-changed();
     callback eq-changed();
@@ -161,6 +167,19 @@ component Section inherits Text {
     font-family: T.display-font;
     font-weight: 800;
     font-size: 24px;
+}
+
+export component PlayerModeSwitch inherits SetRow {
+    title: "Только обычный плеер";
+    text: Prof.ordinary-only ? "Воспроизводятся исходные записи" : "Плеер ищет проверенные версии без цензуры";
+    kind: 1;
+    on: Prof.ordinary-only;
+    accessible-role: switch;
+    accessible-label: root.title;
+    accessible-checkable: true;
+    accessible-checked: Prof.ordinary-only;
+    accessible-action-default => { Prof.set-ordinary-only(!Prof.ordinary-only); }
+    clicked => { Prof.set-ordinary-only(!Prof.ordinary-only); }
 }
 
 component ThemeCard inherits Rectangle {
@@ -579,11 +598,15 @@ component SettingsPage inherits Screen {
                 Prof.changed();
             }
         }
-        SetRow {
+        PlayerModeSwitch { }
+        if !Prof.ordinary-only && !Prof.sources-connected && Prof.sources-attempted: SetRow {
             icons: root.icons;
-            title: "Внешние источники";
-            text: Prof.sources-connected ? "Подключены · отключить" : "Подключить через Яндекс ID";
-            clicked => { Prof.link("external-sources"); }
+            title: "Повторить вход через Яндекс ID";
+            text: Prof.sources-pending ? "Ожидаем подтверждения в браузере" : Prof.sources-error;
+            accessible-role: button;
+            accessible-label: "Повторить вход через Яндекс ID";
+            accessible-action-default => { Prof.retry-sources(); }
+            clicked => { Prof.retry-sources(); }
         }
         Section { text: "Помощь и обратная связь"; }
         SetRow {

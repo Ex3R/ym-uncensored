@@ -44,9 +44,10 @@ impl Buf {
         let mut chunk = [0; 32 * 1024];
         let mut copied = 0;
         while current() {
-            let n = source.read(&mut chunk)?;
+            let n = source.read(&mut chunk).map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e))?;
             if n == 0 && copied == len { return Ok(Self::from_complete_file(file, len)); }
-            if n == 0 || copied + n as u64 > len { return Err(io::Error::other("incomplete audio")); }
+            if n == 0 { return Err(io::ErrorKind::UnexpectedEof.into()); }
+            if copied + n as u64 > len { return Err(io::Error::other("oversized audio")); }
             io::Write::write_all(&mut file, &chunk[..n])?;
             copied += n as u64;
         }

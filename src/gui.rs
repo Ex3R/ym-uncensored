@@ -218,6 +218,9 @@ impl Ctx {
         if let Status::Failed(e) = &s.status {
             // Токен отозван или истёк — обратно на экран входа.
             if self.st.borrow().net.is_none() && e.contains("токен") && !app.get_logged_out() {
+                crate::resolver_login::disconnect();
+                app.set_sources_connected(false);
+                app.set_sources_retry(false);
                 self.st.borrow_mut().cfg.forget_token();
                 self.st.borrow().cfg.save();
                 self.login_start();
@@ -242,6 +245,8 @@ impl Ctx {
         app.set_loading(started && s.waiting_for_playback);
         app.set_position(s.position);
         app.set_track_format(s.format.as_str().into());
+        app.set_audio_version(s.audio_version.ui_index());
+        app.set_audio_version_label(crate::i18n::tr(s.audio_version.label()).into());
         app.set_duration(s.duration);
         app.set_volume(s.volume);
         app.set_shuffle(s.shuffle);
@@ -322,6 +327,7 @@ impl Ctx {
     }
 
     fn on_ready(self: &Rc<Self>, uid: &str) {
+        self.connect_sources(false);
         let token = self.st.borrow().cfg.token.clone().unwrap_or_default();
         let notify = notifier();
         let net = Net::new(Api::new(&token), uid.to_string(), notify);
@@ -1445,6 +1451,19 @@ fn finish_reveal(weak: slint::Weak<AppWindow>, first: bool, tries: u32) {
         keep_on_screen(ui.window());
     }
     sys::raise(ui.window());
+    with_ctx(|c| c.connect_sources(false));
+}
+
+pub(crate) fn open_sources_browser(link: String, generation: u64) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    if slint::invoke_from_event_loop(move || with_ctx(|c| {
+        let ui = c.ui();
+        let opened = Instant::now() < deadline && ui.window().is_visible() && !ui.window().is_minimized()
+            && crate::resolver_login::open_pairing_if_current(&link, generation);
+        let _ = tx.send(opened);
+    })).is_err() { return false; }
+    rx.recv_timeout(Duration::from_secs(3)).unwrap_or(false)
 }
 
 fn notifier() -> Arc<dyn Fn() + Send + Sync> {
@@ -1713,12 +1732,9 @@ fn set_icons(ui: &AppWindow, sprite: &Sprite) {
 }
 
 pub fn run(start_hidden: bool) -> Result<(), slint::PlatformError> {
-    let mut cfg = Config::load();
+    let cfg = Config::load();
+    crate::resolver_login::set_mode_enabled(cfg.uncensor_enabled());
     let sources_connected = crate::resolver_login::credential().is_some();
-    if sources_connected && cfg.sources_setup.is_none() {
-        cfg.sources_setup = Some(true);
-        cfg.save();
-    }
     crate::api::set_lang(&cfg.lang);
     crate::i18n::set_lang(&cfg.lang);
     let dark = match cfg.theme.as_str() {
@@ -1761,8 +1777,8 @@ pub fn run(start_hidden: bool) -> Result<(), slint::PlatformError> {
     app.set_version(version.into());
     app.set_version_upstream(upstream.unwrap_or_default().into());
     app.set_app_name(env!("APP_NAME").into());
-    app.set_sources_requested(cfg.sources_setup == Some(true));
-    app.set_sources_setup_open(!sources_connected && cfg.sources_setup != Some(false));
+    app.set_ordinary_player(!cfg.uncensor_enabled());
+    app.set_sources_retry(cfg.sources_login_attempted && !sources_connected);
     app.set_theme_mode(cfg.theme.clone().into());
     app.set_lang(cfg.lang.clone().into());
     ui.global::<T>().set_lang(cfg.lang.clone().into());
@@ -1775,7 +1791,7 @@ pub fn run(start_hidden: bool) -> Result<(), slint::PlatformError> {
     );
     app.set_discord_on(cfg.discord_enabled);
     app.set_autostart(sys::autostart_enabled());
-    app.set_sources_connected(crate::resolver_login::credential().is_some());
+    app.set_sources_connected(sources_connected);
     app.set_check_updates(cfg.check_updates);
     app.set_allow_explicit(cfg.allow_explicit);
     app.set_linux(cfg!(target_os = "linux"));
@@ -2243,6 +2259,10 @@ pub fn run(start_hidden: bool) -> Result<(), slint::PlatformError> {
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Forward, .. } => {
                 with_ctx(|c| c.go_forward());
                 EventResult::PreventDefault
+            }
+            WindowEvent::Focused(true) => {
+                Timer::single_shot(Duration::ZERO, || with_ctx(|c| c.connect_sources(false)));
+                EventResult::Propagate
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 after_dpi_change();
@@ -2723,16 +2743,35 @@ impl Ctx {
         app.set_logged_out(false);
         app.set_login_code(SharedString::new());
         self.player.send(Cmd::Login(t.access));
-        if self.st.borrow().cfg.sources_setup == Some(true) && crate::resolver_login::credential().is_none() {
-            self.connect_sources();
-        }
     }
 
-    fn connect_sources(self: &Rc<Self>) {
+    fn connect_sources(self: &Rc<Self>, retry: bool) {
+        let ui = self.ui();
+        let visible = ui.window().is_visible() && !ui.window().is_minimized();
+        if !visible || self.player.state().status != Status::Ready { return; }
+        let connected = crate::resolver_login::credential().is_some();
+        if connected {
+            crate::resolver_login::check_saved_session(|| {
+                let _ = slint::invoke_from_event_loop(|| with_ctx(|c| {
+                    if !crate::resolver_login::mode_enabled() || crate::resolver_login::credential().is_some() { return; }
+                    c.ui().global::<App>().set_sources_connected(false);
+                    c.ui().global::<App>().set_sources_retry(true);
+                    c.connect_sources(false);
+                }));
+            });
+            return;
+        }
+        if !self.st.borrow_mut().cfg.begin_sources_login(visible, connected, retry) { return; }
+        ui.global::<App>().set_sources_retry(true);
         crate::resolver_login::connect(|result| {
+            let revision = crate::resolver_login::session_revision();
             let _ = slint::invoke_from_event_loop(move || with_ctx(|c| {
-                c.ui().global::<App>().set_sources_connected(result.is_ok());
-                c.toast(result.err().unwrap_or_else(|| "Внешние источники подключены".into()));
+                if !crate::resolver_login::mode_enabled() || crate::resolver_login::session_revision() != revision { return; }
+                let ui = c.ui();
+                let app = ui.global::<App>();
+                app.set_sources_connected(result.is_ok());
+                app.set_sources_retry(result.is_err());
+                c.toast(result.err().unwrap_or_else(|| "Подбор версий без цензуры подключён".into()));
             }));
         });
     }
@@ -2768,6 +2807,7 @@ impl Ctx {
     fn logout(self: &Rc<Self>) {
         crate::resolver_login::disconnect();
         self.ui().global::<App>().set_sources_connected(false);
+        self.ui().global::<App>().set_sources_retry(false);
         self.player.send(Cmd::Logout);
         {
             let mut st = self.st.borrow_mut();
@@ -3274,18 +3314,16 @@ impl Ctx {
                     self.toast("Не удалось изменить автозапуск");
                 }
             }
-            "external-sources" => {
-                if crate::resolver_login::credential().is_some() {
-                    { let mut st = self.st.borrow_mut(); st.cfg.sources_setup = Some(false); st.cfg.save(); }
-                    app.set_sources_requested(false);
-                    crate::resolver_login::disconnect();
-                    app.set_sources_connected(false);
-                } else {
-                    { let mut st = self.st.borrow_mut(); st.cfg.sources_setup = Some(true); st.cfg.save(); }
-                    app.set_sources_requested(true);
-                    self.connect_sources();
-                }
+            "ordinary-player" => {
+                let enabled = app.get_ordinary_player();
+                self.st.borrow_mut().cfg.set_uncensor_enabled(enabled);
+                app.set_ordinary_player(!enabled);
+                app.set_sources_retry(false);
+                app.set_sources_connected(crate::resolver_login::credential().is_some());
+                self.player.send(Cmd::SourcesModeChanged);
+                if enabled { self.connect_sources(true); }
             }
+            "sources-retry" => self.connect_sources(true),
             "check-updates" => {
                 let on = !app.get_check_updates();
                 app.set_check_updates(on);
@@ -4413,18 +4451,6 @@ fn register_extra(app: &App) {
         })
     });
     app.on_menu_action(|id| with_ctx(|c| c.menu_action(&id)));
-    app.on_sources_choose(|enabled| with_ctx(|c| {
-        {
-            let mut st = c.st.borrow_mut();
-            st.cfg.sources_setup = Some(enabled);
-            st.cfg.save();
-        }
-        let ui = c.ui();
-        let app = ui.global::<App>();
-        app.set_sources_requested(enabled);
-        app.set_sources_setup_open(false);
-        if enabled && c.st.borrow().cfg.token.is_some() { c.connect_sources(); }
-    }));
     app.on_login_start(|| with_ctx(|c| c.login_start()));
     app.on_list_open_artist(|i| {
         with_ctx(|c| {
