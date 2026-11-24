@@ -83,7 +83,9 @@ macos-universal:
     - cargo test --release --locked
     - tools/macos-app.sh --universal --dmg
     - codesign --verify --deep --strict 'target/macos/YM UNCENSORED.app'
-    - lipo -verify_arch arm64 x86_64 'target/macos/YM UNCENSORED.app/Contents/MacOS/yamusic-rs'
+    - |
+      archs=$(lipo -archs 'target/macos/YM UNCENSORED.app/Contents/MacOS/yamusic-rs')
+      case "$archs" in "x86_64 arm64"|"arm64 x86_64") ;; *) exit 1 ;; esac
     - test ! -e 'target/macos/YM UNCENSORED.app/Contents/Resources/originals.json'
     - mkdir dist
     - cp target/macos/ym-uncensored-*-macos.dmg "dist/ym-uncensored-${CI_COMMIT_TAG}-macos-universal.dmg"
