@@ -342,6 +342,7 @@ fn bind_player(ui: &App, player: &Player, sleep: &Rc<RefCell<SleepTimer>>) {
     let p = player.clone();
     now.on_play_pause(move || p.send(Cmd::PlayPause));
     let p = player.clone();
+    now.on_explain_audio_version(|label| toast(label.to_string()));
     now.on_next(move || p.send(Cmd::Next));
     let p = player.clone();
     now.on_prev(move || p.send(Cmd::Prev));
@@ -512,6 +513,9 @@ fn sync(ui: &App, player: &Player, wave: &Rc<RefCell<Option<wave_gl::Wave>>>, qu
     now::track_changed(s.track.as_ref());
     let now = ui.global::<Now>();
     now.set_track_id(s.track.as_ref().map(|t| t.id.as_str()).unwrap_or("").into());
+    now.set_audio_format(s.format.as_str().into());
+    now.set_audio_version(s.audio_version.ui_index());
+    now.set_audio_version_label(s.audio_version.label().into());
     now.set_playing(s.playing);
     now.set_loading(s.waiting_for_playback);
     if s.playing {

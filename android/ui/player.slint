@@ -1,7 +1,7 @@
 // Полный плеер, как в мобильном клиенте: обложка или текст, кнопки, исполнитель, похожие
 // треки, плейлисты, таймер и звук. Координаты в dp сняты с оригинала на экране 411 dp.
 
-import { Now, IconButton, SkipIcon, DeviceIcon, CollapseIcon, Cover, TrackRow, T } from "common.slint";
+import { Now, AudioVersionIndicator, IconButton, SkipIcon, DeviceIcon, CollapseIcon, Cover, TrackRow, T } from "common.slint";
 import { LoadingPulse } from "../../ui/loading-pulse.slint";
 
 /// Кнопка 72×48 под плеером: повтор, текст, таймер, звук.
@@ -111,6 +111,12 @@ export component MiniPlayer inherits Rectangle {
         color: #ffffff80;
         font-size: 14px;
         overflow: elide;
+    }
+    if Now.audio-format != "": AudioVersionIndicator {
+        x: 25px;
+        y: 22px;
+        width: 32px;
+        height: 32px;
     }
     IconButton {
         x: parent.width - 90px;
@@ -373,6 +379,14 @@ export component Player inherits Rectangle {
                     text: Now.position-text;
                     color: #ffffff80;
                     font-size: 14px;
+                }
+                if Now.audio-format != "": AudioVersionIndicator {
+                    x: (controls.width - self.width) / 2;
+                    y: 104px;
+                    width: min(140px, controls.width - 112px);
+                    height: 30px;
+                    with-codec: true;
+                    tint: #ffffffcc;
                 }
                 Text {
                     x: controls.width - root.side - self.width;

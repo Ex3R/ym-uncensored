@@ -1,7 +1,7 @@
 // Светлые страницы: каждая — список блоков, вид блока задаёт kind.
 
 import { ListView } from "std-widgets.slint";
-import { Icons, Now, Cover, T } from "common.slint";
+import { Icons, Now, AudioVersionIndicator, Cover, T } from "common.slint";
 import { Prof } from "profile.slint";
 import { LoadingPulse } from "../../ui/loading-pulse.slint";
 
@@ -1539,6 +1539,12 @@ export component MiniPlayer inherits Rectangle {
     }
     TouchArea {
         clicked => { root.open(); }
+    }
+    if Now.audio-format != "": AudioVersionIndicator {
+        x: 30px;
+        y: 26px;
+        width: 32px;
+        height: 32px;
     }
     Rectangle {
         x: parent.width - 100px;

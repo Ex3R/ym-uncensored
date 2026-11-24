@@ -3,6 +3,7 @@
 import { Theme } from "theme.slint";
 import { Icons, Icon, Cover, ArtistLinks, ExplicitMark } from "widgets.slint";
 import { T, App, TrackItem } from "state.slint";
+import { AudioFormatBadge } from "playerbar.slint";
 import { LoadingPulse } from "loading-pulse.slint";
 
 component RoundButton inherits Rectangle {
@@ -213,6 +214,11 @@ component Poster inherits Rectangle {
         ink: #ffffff80;
         ink-hover: #ffffffe6;
         clicked(i) => { App.open-current-artist(i); }
+    }
+
+    if App.track-format != "": AudioFormatBadge {
+        x: (parent.width - self.width) / 2;
+        y: 471px;
     }
 
     // Прогресс под обложкой, время слева и справа при наведении.

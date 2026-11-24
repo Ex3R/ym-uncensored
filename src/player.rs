@@ -67,6 +67,25 @@ pub enum Repeat {
     One,
 }
 
+/// What the verified audio pair establishes about the currently queued decoder.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub enum AudioVersion {
+    #[default]
+    Unknown,
+    Censored,
+    Uncensored,
+}
+
+impl AudioVersion {
+    pub fn label(self) -> &'static str {
+        match self { Self::Unknown => "Версия не проверена", Self::Censored => "С цензурой", Self::Uncensored => "Без цензуры" }
+    }
+
+    pub fn ui_index(self) -> i32 {
+        match self { Self::Unknown => 0, Self::Censored => 1, Self::Uncensored => 2 }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Shared {
     pub status: Status,
@@ -92,6 +111,7 @@ pub struct Shared {
     pub resumed: bool,
     /// Формат играющего файла: «MP3 320», «AAC».
     pub format: String,
+    pub audio_version: AudioVersion,
 }
 
 /// Как положение ползунка громкости переводится в усиление.
@@ -309,6 +329,23 @@ type Audio = (Arc<Buf>, Decoder<Reader>, String);
 struct LoadedTrack {
     baseline: Audio,
     known: KnownStatus,
+}
+
+#[derive(Clone, Copy)]
+enum FirstBuffer {
+    Catalog,
+    Known,
+    Prefetch,
+}
+
+impl FirstBuffer {
+    fn version(self) -> AudioVersion {
+        match self { Self::Catalog => AudioVersion::Unknown, Self::Known | Self::Prefetch => AudioVersion::Uncensored }
+    }
+
+    fn name(self) -> &'static str {
+        match self { Self::Catalog => "catalog", Self::Known => "known", Self::Prefetch => "prefetch" }
+    }
 }
 
 enum KnownStatus {
@@ -530,13 +567,13 @@ fn resolve_track(
             Some(candidate)
         };
         let mut seen = std::collections::HashSet::new();
-        let mut try_yandex = |id: &str, label: &str| {
+        let mut try_yandex = |id: &str| {
             if !current() || !seen.insert(id.to_owned()) { return None; }
             let (buf, decoder, format) = load_audio(api, id).ok()?;
-            check((buf, decoder, format!("{format} · {label}")))
+            check((buf, decoder, format))
         };
         for id in originals::catalog_versions(api, t) {
-            if let Some(audio) = try_yandex(&id, "Без цензуры") {
+            if let Some(audio) = try_yandex(&id) {
                 if current() { originals::remember_catalog(t, id, buf.clone(), audio.0.clone(), revision); }
                 return Some(audio);
             }
@@ -1256,6 +1293,9 @@ impl Engine {
         self.fading = None;
         self.loaded = false;
         self.held_pos = None;
+        let mut s = self.sh();
+        s.format.clear();
+        s.audio_version = AudioVersion::Unknown;
     }
 
     fn clear_queue(&mut self) {
@@ -1502,6 +1542,7 @@ impl Engine {
                         if audio.is_some() {
                             check.finished = true;
                             check.audio = audio;
+                            self.mark_compared_catalog();
                         } else {
                             self.current_check = None; // Let the regular background verification run.
                         }
@@ -1514,8 +1555,13 @@ impl Engine {
             }
             Msg::Replacement { job, audio } => {
                 let revision = crate::resolver_login::session_revision();
-                if let Some(check) = self.current_check.iter_mut().chain(self.next_check.iter_mut())
-                    .find(|c| c.revision == revision && job.ptr_eq(&Arc::downgrade(&c.owner))) {
+                let matches = |check: &ReplacementCheck| check.revision == revision && job.ptr_eq(&Arc::downgrade(&check.owner));
+                if let Some(check) = self.current_check.as_mut().filter(|c| matches(c)) {
+                    let proven = audio.is_some();
+                    check.audio = audio;
+                    check.finished = true;
+                    if proven { self.mark_compared_catalog(); }
+                } else if let Some(check) = self.next_check.as_mut().filter(|c| matches(c)) {
                     check.audio = audio;
                     check.finished = true;
                 }
@@ -1942,8 +1988,11 @@ impl Engine {
         if !self.loaded || self.current_buf.as_ref().is_none_or(|buf| Arc::ptr_eq(buf, &catalog)) { return; }
         let position = self.pos();
         if let Some(sink) = self.sink() { sink.clear(); }
-        self.current_buf = Some(catalog);
-        self.sh().format = format;
+        let catalog_version = match self.sh().audio_version {
+            AudioVersion::Unknown => AudioVersion::Unknown,
+            AudioVersion::Censored | AudioVersion::Uncensored => AudioVersion::Censored,
+        };
+        self.set_active_buffer(catalog, format, catalog_version);
         if self.audio.is_none() { return; }
         if !self.restore_at(position) {
             self.held_pos = Some(position);
@@ -2144,6 +2193,7 @@ impl Engine {
             s.position = 0.0;
             s.duration = t.duration_ms as f32 / 1000.0;
             s.format.clear();
+            s.audio_version = AudioVersion::Unknown;
             s.loading = true;
         }
         if self.prefetch.as_ref().map(|(id, _)| *id == t.id).unwrap_or(false) {
@@ -2193,13 +2243,13 @@ impl Engine {
         }));
     }
 
-    fn initial_audio(&mut self, track: &Track, loaded: LoadedTrack) -> (Audio, &'static str) {
+    fn initial_audio(&mut self, track: &Track, loaded: LoadedTrack) -> (Audio, FirstBuffer) {
         self.catalog_buf = Some((loaded.baseline.0.clone(), loaded.baseline.2.clone()));
         let revision = crate::resolver_login::session_revision();
         self.current_lookup_revision = Some(loaded.known.attempted_revision());
         if let Some(prepared) = self.take_current_replacement() {
             self.current_lookup_revision = Some(revision);
-            return (prepared, "prefetch");
+            return (prepared, FirstBuffer::Prefetch);
         }
         if replacements_enabled() && loaded.known.revision() == Some(revision) {
             if let Some(owner) = &self.current_load {
@@ -2207,10 +2257,10 @@ impl Engine {
                 self.current_check = Some(ReplacementCheck {
                     id: track.id.clone(), revision, owner: owner.clone(), finished, audio: None,
                 });
-                if let KnownStatus::Verified(_, audio) = loaded.known { return (audio, "known"); }
+                if let KnownStatus::Verified(_, audio) = loaded.known { return (audio, FirstBuffer::Known); }
             }
         }
-        (loaded.baseline, "catalog")
+        (loaded.baseline, FirstBuffer::Catalog)
     }
 
     fn play_loaded(&mut self, loaded: LoadedTrack) {
@@ -2241,11 +2291,10 @@ impl Engine {
             if let Some((_, pos)) = resume_position {
                 if let Err(e) = sink.try_seek(Duration::from_secs_f32(pos)) { log(format!("seek: {e:?}")); }
             }
-            log(format!("Первый буфер {}: {origin}, {format}, {} мс", t.id, self.load_started.elapsed().as_millis()));
+            log(format!("Первый буфер {}: {}, {format}, {} мс", t.id, origin.name(), self.load_started.elapsed().as_millis()));
             if !paused { sink.play(); }
         }
-        self.current_buf = Some(buf);
-        self.sh().format = format;
+        self.set_active_buffer(buf, format, origin.version());
         self.loaded = true;
         self.held_pos = None;
         self.errors_in_row = 0;
@@ -2257,6 +2306,20 @@ impl Engine {
         if let Some(listen) = self.listen.as_mut().filter(|_| resume_position.is_some()) { listen.seek = true; }
         self.publish_soon();
         self.prefetch_next();
+    }
+
+    fn set_active_buffer(&mut self, buf: Arc<Buf>, format: String, version: AudioVersion) {
+        self.current_buf = Some(buf);
+        let mut s = self.sh();
+        s.format = format;
+        s.audio_version = version;
+    }
+
+    fn mark_compared_catalog(&self) {
+        if self.loaded && self.current_buf.as_ref().zip(self.catalog_buf.as_ref())
+            .is_some_and(|(active, (catalog, _))| Arc::ptr_eq(active, catalog)) {
+            self.sh().audio_version = AudioVersion::Censored;
+        }
     }
 
     fn take_current_replacement(&mut self) -> Option<Audio> {
@@ -2313,8 +2376,7 @@ impl Engine {
                     if let Some(track) = &self.current {
                         log(format!("Замена буфера {}: {format}, {:.2} с", track.id, position));
                     }
-                    self.current_buf = Some(buf);
-                    self.sh().format = format;
+                    self.set_active_buffer(buf, format, AudioVersion::Uncensored);
                     (self.notify)();
                 } else {
                     if let Some(sink) = self.sink() { sink.clear(); }
@@ -2633,7 +2695,8 @@ mod tests {
             let expected_buf = if expected == "known" { alternative.0.clone() } else { baseline.0.clone() };
             let loaded = LoadedTrack { baseline, known: KnownStatus::Verified(issued, alternative) };
             let ((buf, mut decoder, _), origin) = engine.initial_audio(&track, loaded);
-            assert_eq!(origin, expected);
+            assert_eq!(origin.name(), expected);
+            assert_eq!(origin.version(), if issued == revision { AudioVersion::Uncensored } else { AudioVersion::Unknown });
             assert!(Arc::ptr_eq(&engine.catalog_buf.as_ref().unwrap().0, &catalog));
             assert!(Arc::ptr_eq(&buf, &expected_buf));
             assert!(decoder.next().is_some());
@@ -2675,7 +2738,7 @@ mod tests {
         let known = initial_status(&pending, revision, Duration::from_millis(5));
         assert!(matches!(known, KnownStatus::Pending(_)));
         let loaded = LoadedTrack { baseline: make_audio("baseline"), known };
-        assert_eq!(engine.initial_audio(&track, loaded).1, "catalog");
+        assert_eq!(engine.initial_audio(&track, loaded).1.name(), "catalog");
         assert!(!engine.current_check.as_ref().unwrap().finished);
         let stale = Arc::new(());
         engine.handle(Msg::KnownFinished { owner: Arc::downgrade(&stale), revision, audio: Some(make_audio("stale")) });
@@ -2709,9 +2772,36 @@ mod tests {
             let elapsed = started.elapsed().as_millis();
             // The decoder is exactly the one returned to play_loaded for the first sink.append.
             assert!(decoder.take(6 * 96000).any(|sample| sample.unsigned_abs() > 32));
-            eprintln!("first buffer {id} {origin} {format}, {elapsed}ms, encoded {}", crate::originals::media_digest(buf.reader()).unwrap());
-            assert_eq!(origin, expected, "first decoder for {id}");
+            eprintln!("first buffer {id} {} {format}, {elapsed}ms, encoded {}", origin.name(), crate::originals::media_digest(buf.reader()).unwrap());
+            assert_eq!(origin.name(), expected, "first decoder for {id}");
         }
+    }
+
+    #[test]
+    fn catalog_label_requires_evidence_for_the_playing_decoder() {
+        let _guard = super::EXPLICIT_TEST_LOCK.lock().unwrap();
+        let revision = crate::resolver_login::session_revision();
+        let mut e = Engine::new(mpsc::channel().0, Default::default(), Default::default(), Arc::new(|| {}), Default::default());
+        let track = crate::api::parse_track(&serde_json::json!({"id":7, "title":"Track", "explicit":true})).unwrap();
+        e.current = Some(track.clone());
+        let owner = Arc::downgrade(e.current_load.insert(Arc::new(())));
+        let ((baseline, _, codec), origin) = e.initial_audio(&track, LoadedTrack { baseline: make_audio("MP3 320"), known: KnownStatus::Pending(revision) });
+        e.set_active_buffer(baseline, codec, origin.version());
+        e.loaded = true;
+        assert_eq!(e.sh().audio_version, AudioVersion::Unknown);
+        let stale = Arc::new(());
+        e.handle(Msg::KnownFinished { owner: Arc::downgrade(&stale), revision, audio: Some(make_audio("MP3")) });
+        assert_eq!(e.sh().audio_version, AudioVersion::Unknown);
+        e.handle(Msg::KnownFinished { owner, revision, audio: Some(make_audio("MP3")) });
+        assert_eq!(e.sh().audio_version, AudioVersion::Censored);
+        assert_eq!(e.sh().format, "MP3 320");
+        let (alt, _, codec) = e.take_current_replacement().unwrap();
+        e.set_active_buffer(alt, codec, AudioVersion::Uncensored);
+        assert_eq!(e.sh().audio_version, AudioVersion::Uncensored);
+        assert_eq!(e.sh().format, "MP3");
+        e.stop_audio();
+        assert_eq!(e.sh().audio_version, AudioVersion::Unknown);
+        assert!(e.sh().format.is_empty());
     }
 
     #[test]
@@ -2745,7 +2835,7 @@ mod tests {
         let mut e = Engine::new(mpsc::channel().0, Default::default(), Default::default(), Arc::new(|| {}), Default::default());
         let catalog = make_audio("MP3 192").0;
         e.catalog_buf = Some((catalog.clone(), "MP3 192".into()));
-        e.current_buf = Some(make_audio("provider").0);
+        e.set_active_buffer(make_audio("MP3").0, "MP3".into(), AudioVersion::Uncensored);
         e.current = Some(track(7));
         e.queue.push_back(track(8));
         e.loaded = true;
@@ -2754,6 +2844,7 @@ mod tests {
         e.sources_mode_changed(false);
         assert!(Arc::ptr_eq(&catalog, e.current_buf.as_ref().unwrap()));
         assert_eq!(e.sh().format, "MP3 192");
+        assert_eq!(e.sh().audio_version, AudioVersion::Censored);
         assert!(e.paused);
         assert_eq!(e.pos(), 12.0);
         assert_eq!(e.current.as_ref().unwrap().id, "7");

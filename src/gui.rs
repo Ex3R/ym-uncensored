@@ -245,6 +245,8 @@ impl Ctx {
         app.set_loading(started && s.waiting_for_playback);
         app.set_position(s.position);
         app.set_track_format(s.format.as_str().into());
+        app.set_audio_version(s.audio_version.ui_index());
+        app.set_audio_version_label(crate::i18n::tr(s.audio_version.label()).into());
         app.set_duration(s.duration);
         app.set_volume(s.volume);
         app.set_shuffle(s.shuffle);

@@ -401,7 +401,7 @@ fn fetch_audio(candidate: &OnlineCandidate, token: String, cached: Option<std::s
     let response = request.timeout(timeout).send().map_err(|e| e.to_string())?;
     let reused = response.status() == reqwest::StatusCode::NOT_MODIFIED;
     let buf = ticket_audio(response, candidate.sha256.as_deref(), cached, current)?;
-    Ok(ExternalAudio { buf, format: format!("MP3 · {}", candidate.source), cached: reused, token })
+    Ok(ExternalAudio { buf, format: "MP3".into(), cached: reused, token })
 }
 
 fn ticket_audio(response: reqwest::blocking::Response, expected: Option<&str>, cached: Option<std::sync::Arc<crate::stream::Buf>>, current: &impl Fn() -> bool) -> Res<std::sync::Arc<crate::stream::Buf>> {
@@ -448,7 +448,7 @@ pub fn known_audio(
         let response = resolver_login::signed("GET", &path, &token, vec![]).ok()?
             .timeout(Duration::from_secs(4)).send().ok()?;
         let (buf, format) = catalog_ticket_audio(response, track, media, current, load_catalog)?;
-        return Some(ExternalAudio { buf, format: format!("{format} · Яндекс Музыка · Без цензуры"), cached: false, token });
+        return Some(ExternalAudio { buf, format, cached: false, token });
     }
     let cached = cached_audio(&token, track, media, &pair, hit.baseline_sha256.as_deref()).or_else(|| {
         hit.baseline_sha256s.iter().find_map(|s| cached_audio(&token, track, media, &pair_digest(track, s, media), Some(s)))

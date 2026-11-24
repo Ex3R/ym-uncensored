@@ -1,10 +1,34 @@
 // Нижний плеер.
 
+import { VersionMark } from "version-mark.slint";
 import { Theme } from "theme.slint";
 import { Icons, Icon, BarButton, Cover, ArtistLinks, ExplicitMark } from "widgets.slint";
 import { App } from "state.slint";
 import { VolumePopup } from "popups.slint";
 import { LoadingPulse } from "loading-pulse.slint";
+
+export component AudioFormatBadge inherits HorizontalLayout {
+    height: 18px;
+    width: self.preferred-width;
+    spacing: 5px;
+    alignment: center;
+    Text {
+        text: App.track-format;
+        font-size: Theme.font-size-label-s;
+        font-weight: 500;
+        color: #ffffffb3;
+        vertical-alignment: center;
+    }
+    VerticalLayout {
+        alignment: center;
+        VersionMark {
+            status: App.audio-version;
+            label: App.audio-version-label;
+            ink: #ffffffd9;
+            Tooltip { text: @markdown("\{App.audio-version-label}"); }
+        }
+    }
+}
 
 component TransportButton inherits BarButton {
     grow-on-hover: true;
@@ -179,15 +203,10 @@ export component PlayerBar inherits Rectangle {
             TransportButton { x: c + 72px; y: 24px; icon: App.repeat == 2 ? Icons.repeat-one : Icons.repeat; enabled: on && !App.is-wave; active: App.repeat > 0; ink-hover: self.ink; clicked => { App.cycle-repeat(); } }
             BarButton { x: c + 120px; y: 18px; width: 44px; height: 44px; icon: App.liked ? Icons.liked : Icons.like; enabled: on; clicked => { App.like(); } }
 
-            if on && App.track-format != "": Text {
-                x: parent.width - 201px - self.width;
-                y: 28px;
-                height: 16px;
-                text: App.track-format;
-                vertical-alignment: center;
-                font-size: Theme.font-size-label-s;
-                font-weight: 500;
-                color: #ffffff66;
+            if on && App.track-format != "": AudioFormatBadge {
+                property <bool> fits: parent.width / 2 - 365px > self.preferred-width;
+                x: parent.width - (fits ? 201px : 14px) - self.width;
+                y: fits ? 27px : 58px;
             }
             BarButton { x: parent.width - 193px; y: 24px; icon: Icons.lyrics; enabled: on && App.has-lyrics; clicked => { App.open-fullscreen(2); } }
             BarButton { x: parent.width - 145px; y: 24px; icon: Icons.queue; enabled: on; clicked => { App.open-fullscreen(1); } }
@@ -320,6 +339,11 @@ export component MiniPlayer inherits Rectangle {
         TransportButton { x: parent.width - 136px; y: 28px; icon: Icons.prev-small; icon-size: 20px; enabled: on && App.can-prev; clicked => { App.prev(); } }
         BarPlayButton { x: parent.width - 96px; y: 24px; enabled: on; }
         TransportButton { x: parent.width - 48px; y: 28px; icon: Icons.next-small; icon-size: 20px; enabled: on; clicked => { App.next(); } }
+
+        if on && App.track-format != "": AudioFormatBadge {
+            x: parent.width - 80px - self.width / 2;
+            y: 65px;
+        }
 
         // Громкость при наведении: значок выключает звук, полоску можно тянуть.
         if ta.has-hover || vol-ta.pressed: BarButton {
