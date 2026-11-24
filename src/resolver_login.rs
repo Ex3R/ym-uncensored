@@ -15,11 +15,18 @@ struct State {
 }
 
 pub fn http() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(4))
-        .timeout(Duration::from_secs(8))
-        .redirect(reqwest::redirect::Policy::none())
-        .build().map_err(|e| e.to_string())
+    static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        let builder = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(4))
+            .timeout(Duration::from_secs(8))
+            .redirect(reqwest::redirect::Policy::none());
+        #[cfg(test)]
+        let builder = if std::env::var_os("YM_TEST_OFFLINE_SOURCES").is_some() {
+            builder.no_proxy().resolve("ym.idkroma.ru", std::net::SocketAddr::from(([127,0,0,1],443)))
+        } else { builder };
+        builder.build().map_err(|e| e.to_string())
+    }).clone()
 }
 
 fn valid(value: &str) -> bool {

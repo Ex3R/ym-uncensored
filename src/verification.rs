@@ -118,7 +118,24 @@ fn full_speech_model() -> Option<&'static std::sync::Mutex<whisper_rs::WhisperCo
         if !path.is_file() {
             #[cfg(target_os = "android")]
             return crate::sys::speech_model().map(Mutex::new);
-            #[cfg(not(target_os = "android"))]
+            #[cfg(target_os = "windows")]
+            {
+                #[cfg(ym_windows_speech_model)]
+                return WhisperContext::new_from_buffer_with_params(include_bytes!(env!("YM_WINDOWS_SPEECH_MODEL")), Default::default()).ok().map(Mutex::new);
+                #[cfg(not(ym_windows_speech_model))]
+                return None;
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                let exe = std::env::current_exe().ok()?;
+                #[cfg(target_os = "linux")]
+                let resource = "../share/yamusic-rs/ggml-small-q5_1.bin";
+                #[cfg(target_os = "macos")]
+                let resource = "../Resources/ggml-small-q5_1.bin";
+                let model = exe.parent()?.join(resource);
+                return WhisperContext::new_with_params(model, Default::default()).ok().map(Mutex::new);
+            }
+            #[cfg(not(any(target_os="macos",target_os="linux",target_os="android",target_os="windows")))]
             return None;
         }
         WhisperContext::new_with_params(path, WhisperContextParameters::default())

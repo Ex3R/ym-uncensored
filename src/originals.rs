@@ -182,11 +182,15 @@ fn recording_query(track: &Track) -> Option<String> {
 }
 
 use crate::resolver_login;
+#[path = "confirmed_audio.rs"]
+mod confirmed_audio;
+pub(crate) use confirmed_audio::digest as media_digest;
 
 #[derive(Deserialize)]
 pub struct OnlineCandidate {
     source: String,
     ticket: String,
+    sha256: Option<String>,
     pub next: Option<String>,
 }
 
@@ -203,7 +207,7 @@ pub fn online_candidates(track: &Track) -> Res<Vec<OnlineCandidate>> {
         .send().and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
     let candidates: Vec<OnlineCandidate> = serde_json::from_reader(response.take(16 * 1024)).map_err(|e| e.to_string())?;
     Ok(candidates.into_iter().filter(|c| c.ticket.len() == 32 && c.ticket.bytes().all(|b| b.is_ascii_hexdigit())
-        && matches!(c.source.as_str(), "Bandcamp" | "SoundCloud" | "YouTube Music")).take(12).collect())
+        && matches!(c.source.as_str(), "Bandcamp" | "SoundCloud" | "YouTube Music" | "Audius")).take(12).collect())
 }
 
 pub fn online_next(next: &str) -> Res<Vec<OnlineCandidate>> {
@@ -215,17 +219,49 @@ pub fn online_next(next: &str) -> Res<Vec<OnlineCandidate>> {
         .send().and_then(|r|r.error_for_status()).map_err(|e|e.to_string())?;
     let candidates: Vec<OnlineCandidate> = serde_json::from_reader(response.take(16*1024)).map_err(|e|e.to_string())?;
     Ok(candidates.into_iter().filter(|c|c.ticket.len()==32 && c.ticket.bytes().all(|b|b.is_ascii_hexdigit())
-        && matches!(c.source.as_str(),"Bandcamp"|"SoundCloud"|"YouTube Music")).take(12).collect())
+        && matches!(c.source.as_str(),"Bandcamp"|"SoundCloud"|"YouTube Music"|"Audius")).take(12).collect())
 }
 
-pub fn online_audio(candidate: &OnlineCandidate) -> Res<(std::sync::Arc<crate::stream::Buf>, String)> {
+pub struct ExternalAudio {
+    pub buf: std::sync::Arc<crate::stream::Buf>,
+    pub format: String,
+    pub cached: bool,
+    token: String,
+}
+
+pub fn online_audio(candidate: &OnlineCandidate, track: &str, original: Option<&str>) -> Res<ExternalAudio> {
     let token = resolver_login::credential().ok_or("Сначала подключите внешние источники")?;
-    let response = resolver_login::signed("GET", &format!("/audio/{}",candidate.ticket), &token, vec![])?
-        .timeout(Duration::from_secs(48)).send().and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
-    let buf = crate::stream::Buf::from_media(response).map_err(|e| e.to_string())?;
-    Ok((buf, format!("MP3 · {}", candidate.source)))
+    let mut request = resolver_login::signed("GET", &format!("/audio/{}",candidate.ticket), &token, vec![])?;
+    let cached = original.zip(candidate.sha256.as_deref()).and_then(|(original, expected)| {
+        if expected.len()!=64 || !expected.bytes().all(|c| c.is_ascii_hexdigit()) { return None; }
+        confirmed_audio::read(&confirmed_audio::path(&token,track,original,expected),expected)
+    });
+    if cached.is_some() {
+        request = request.header("If-None-Match",format!("\"{}\"",candidate.sha256.as_deref().unwrap_or_default()));
+    }
+    let response = request.timeout(Duration::from_secs(48)).send().map_err(|e| e.to_string())?;
+    let reused = response.status() == reqwest::StatusCode::NOT_MODIFIED;
+    let buf = if reused {
+        cached.ok_or("Нет подтверждённой копии")?
+    } else {
+        let response = response.error_for_status().map_err(|e| e.to_string())?;
+        crate::stream::Buf::from_media(response).map_err(|e| e.to_string())?
+    };
+    Ok(ExternalAudio { buf, format: format!("MP3 · {}",candidate.source), cached: reused,token })
 }
 
+pub fn remember_external(result: ExternalAudio, candidate: &OnlineCandidate, track: &str, original: Option<&str>) {
+    let Ok(digest) = confirmed_audio::digest(result.buf.reader()) else { return };
+    if let Some(original) = original {
+        let _ = confirmed_audio::store(&confirmed_audio::path(&result.token,track,original,&digest), &result.buf);
+    }
+    let body = serde_json::json!({"ticket":candidate.ticket,"sha256":digest}).to_string().into_bytes();
+    std::thread::spawn(move || {
+        if let Ok(request) = resolver_login::signed("POST","/confirm",&result.token,body) {
+            let _ = request.send();
+        }
+    });
+}
 #[cfg(test)]
 mod tests {
     use super::*;

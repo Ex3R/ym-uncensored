@@ -37,6 +37,8 @@ if ! echo "$TOOL_SHA256  $TOOL" | sha256sum -c --status 2>/dev/null; then
 fi
 
 rm -rf "$APPDIR"
+mkdir -p "$APPDIR/usr/share/yamusic-rs"
+python3 tools/android-speech-model.py "$APPDIR/usr/share/yamusic-rs"
 install -Dm755 target/release/yamusic-rs "$APPDIR/usr/bin/yamusic-rs"
 install -Dm644 -t "$APPDIR/usr/share/licenses/yamusic-rs" models/*-LICENSE
 install -Dm644 packaging/yamusic-rs.desktop "$APPDIR/usr/share/applications/yamusic-rs.desktop"

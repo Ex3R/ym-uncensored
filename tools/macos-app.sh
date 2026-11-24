@@ -76,6 +76,7 @@ fi
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+python3 tools/android-speech-model.py "$APP/Contents/Resources"
 mkdir -p "$APP/Contents/Resources/licenses"
 cp models/*-LICENSE "$APP/Contents/Resources/licenses/"
 cp "$BIN" "$APP/Contents/MacOS/$EXE"

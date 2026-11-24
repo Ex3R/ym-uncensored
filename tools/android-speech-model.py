@@ -1,4 +1,4 @@
-"""Stage the pinned multilingual Whisper model into an Android APK."""
+"""Stage the pinned multilingual Whisper model for the offline speech verifier."""
 import hashlib
 import os
 from pathlib import Path
