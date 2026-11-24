@@ -34,11 +34,11 @@ impl Recording {
         let mut previous = 0.0;
         for chunk in pcm.chunks(2048) {
             let mut bytes = [0_u8; 4096];
-            for (dst, sample) in bytes.chunks_exact_mut(2).zip(chunk) {
+            for (dst, sample) in bytes.as_chunks_mut::<2>().0.iter_mut().zip(chunk) {
                 dst.copy_from_slice(&sample.to_le_bytes());
             }
             hash.update(&bytes[..chunk.len() * 2]);
-            for frame in chunk.chunks_exact(16) {
+            for frame in chunk.as_chunks::<16>().0 {
                 let value = frame.iter().map(|&s| s as f32).sum::<f32>() / (16.0 * 32768.0);
                 envelope.push(value - previous);
                 previous = value;

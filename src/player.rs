@@ -2140,7 +2140,7 @@ mod tests {
         let token = std::env::var("YM_TOKEN").expect("YM_TOKEN");
         let catalog_id = std::env::var("ANCENSOR_TEST_TRACK").expect("ANCENSOR_TEST_TRACK");
         let api = Api::new(&token);
-        let track = api.tracks(&[catalog_id.clone()]).expect("catalog lookup").remove(0);
+        let track = api.tracks(std::slice::from_ref(&catalog_id)).expect("catalog lookup").remove(0);
         assert_eq!(track.id, catalog_id);
         let (_, decoder, format) = load_track(&api, &track).expect("stream and decode personal upload");
         let expected = std::env::var("ANCENSOR_TEST_SOURCE").unwrap_or_else(|_| "Личная версия".into());

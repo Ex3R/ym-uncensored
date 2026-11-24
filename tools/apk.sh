@@ -78,6 +78,10 @@ find android/java "$OUT/gen" -name '*.java' > "$OUT/sources.txt"
 (cd "$STAGE" && zip -q -r ../unsigned.apk .)
 "$BT/zipalign" -P 16 -f 4 "$UNSIGNED" "$OUT/aligned.apk"
 
+if [ "${APK_UNSIGNED_ONLY:-0}" = "1" ]; then
+  # Only this aligned artifact goes to the release owner for offline signing.
+  exit 0
+fi
 APK="$OUT/yamusic-rs-$ABI.apk"
 # Подпись v1 apksigner при minSdk 26 пропускает, а установщики некоторых оболочек без неё пишут «нет сертификата».
 SIGN="--v1-signing-enabled true"

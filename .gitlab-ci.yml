@@ -9,7 +9,7 @@ stages: [build, release]
 variables:
   CARGO_PROFILE_RELEASE_LTO: "false"
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "8"
-  RELEASE_VERSION: "v0.1.0"
+  RELEASE_VERSION: "v0.2.0"
 
 .linux:
   stage: build

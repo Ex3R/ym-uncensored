@@ -133,7 +133,7 @@ mod tests {
             let path = file.path();
             if path.extension().and_then(|s| s.to_str()) != Some("pcm") { continue; }
             let bytes = std::fs::read(&path).unwrap();
-            let samples: Vec<i16> = bytes.chunks_exact(2).map(|p| i16::from_le_bytes([p[0], p[1]])).collect();
+            let samples: Vec<i16> = bytes.as_chunks::<2>().0.iter().copied().map(i16::from_le_bytes).collect();
             let start = std::time::Instant::now();
             let audio = rodio::buffer::SamplesBuffer::new(1, 16_000, samples);
             let result = vocal_language(audio, 0);
