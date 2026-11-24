@@ -477,6 +477,11 @@ export component SettingsPage inherits Rectangle {
                 clicked => { App.setting("autostart"); }
             }
             SettingItem {
+                title: T.t("Внешние источники");
+                desc: App.sources-connected ? T.t("Подключены · отключить") : T.t("Подключить через Яндекс ID");
+                clicked => { App.setting("external-sources"); }
+            }
+            SettingItem {
                 title: T.t("Проверять обновления");
                 desc: T.t("Показывать кнопку «Обновить», когда выходит новая версия");
                 toggle: true;

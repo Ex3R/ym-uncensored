@@ -267,7 +267,7 @@ fn recording_query(track: &Track) -> Option<String> {
     Some(format!("{title} {}", track.artists))
 }
 
-const RESOLVER: &str = "https://ym.idkroma.ru/api/uncensored/v1";
+use crate::resolver_login::{self, BASE as RESOLVER};
 
 #[derive(Deserialize)]
 pub struct OnlineCandidate {
@@ -275,22 +275,15 @@ pub struct OnlineCandidate {
     ticket: String,
 }
 
-fn resolver_http() -> Res<reqwest::blocking::Client> {
-    // Yandex account credentials belong only to the catalog client.
-    reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(4))
-        .redirect(reqwest::redirect::Policy::none())
-        .build().map_err(|e| e.to_string())
-}
-
 pub fn online_candidates(track: &Track) -> Res<Vec<OnlineCandidate>> {
     use std::io::Read;
+    let Some(token) = resolver_login::credential() else { return Ok(vec![]) };
     let lower = normalized(&track.title);
     let (base, _) = title_variant(&lower);
     let version = normalized(&track.version);
     let title = if version.is_empty() || variant(&version).is_some() { base.to_owned() } else { format!("{base} ({version})") };
     let artists: Vec<_> = track.artist_list.iter().map(|a| &a.name).collect();
-    let response = resolver_http()?.post(format!("{RESOLVER}/search"))
+    let response = resolver_login::http()?.post(format!("{RESOLVER}/search")).bearer_auth(token)
         .timeout(Duration::from_secs(19))
         .json(&serde_json::json!({"title":title, "artists":artists, "duration_ms":track.duration_ms}))
         .send().and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
@@ -300,7 +293,8 @@ pub fn online_candidates(track: &Track) -> Res<Vec<OnlineCandidate>> {
 }
 
 pub fn online_audio(candidate: &OnlineCandidate) -> Res<(std::sync::Arc<crate::stream::Buf>, String)> {
-    let response = resolver_http()?.get(format!("{RESOLVER}/audio/{}", candidate.ticket))
+    let token = resolver_login::credential().ok_or("Сначала подключите внешние источники")?;
+    let response = resolver_login::http()?.get(format!("{RESOLVER}/audio/{}", candidate.ticket)).bearer_auth(token)
         .timeout(Duration::from_secs(48)).send().and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
     let buf = crate::stream::Buf::from_media(response).map_err(|e| e.to_string())?;
     Ok((buf, format!("MP3 · {}", candidate.source)))

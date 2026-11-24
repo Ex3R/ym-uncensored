@@ -47,6 +47,8 @@ mod palette;
 #[path = "../../src/player.rs"]
 #[allow(dead_code)]
 mod player;
+#[path = "../../src/resolver_login.rs"]
+mod resolver_login;
 #[path = "../../src/originals.rs"]
 mod originals;
 #[path = "../../src/save.rs"]
@@ -284,6 +286,8 @@ fn logged_in(ui: &App, token: &str, player: &Player) {
 }
 
 fn logout(ui: &App, player: &Player) {
+    crate::resolver_login::disconnect();
+    ui.global::<Prof>().set_sources_connected(false);
     player.send(Cmd::Logout);
     let mut c = Config::load();
     if let Some(token) = c.token.clone() {

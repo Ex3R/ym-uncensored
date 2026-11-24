@@ -1770,6 +1770,7 @@ pub fn run(start_hidden: bool) -> Result<(), slint::PlatformError> {
     );
     app.set_discord_on(cfg.discord_enabled);
     app.set_autostart(sys::autostart_enabled());
+    app.set_sources_connected(crate::resolver_login::credential().is_some());
     app.set_check_updates(cfg.check_updates);
     app.set_allow_explicit(cfg.allow_explicit);
     app.set_linux(cfg!(target_os = "linux"));
@@ -2748,6 +2749,8 @@ impl Ctx {
     }
 
     fn logout(self: &Rc<Self>) {
+        crate::resolver_login::disconnect();
+        self.ui().global::<App>().set_sources_connected(false);
         self.player.send(Cmd::Logout);
         {
             let mut st = self.st.borrow_mut();
@@ -3251,6 +3254,19 @@ impl Ctx {
                     app.set_autostart(on);
                 } else {
                     self.toast("Не удалось изменить автозапуск");
+                }
+            }
+            "external-sources" => {
+                if crate::resolver_login::credential().is_some() {
+                    crate::resolver_login::disconnect();
+                    app.set_sources_connected(false);
+                } else {
+                    crate::resolver_login::connect(|result| {
+                        let _ = slint::invoke_from_event_loop(move || with_ctx(|c| {
+                            c.ui().global::<App>().set_sources_connected(result.is_ok());
+                            c.toast(result.err().unwrap_or_else(|| "Внешние источники подключены".into()));
+                        }));
+                    });
                 }
             }
             "check-updates" => {

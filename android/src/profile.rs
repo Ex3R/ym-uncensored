@@ -48,6 +48,7 @@ pub fn bind(ui: &App, player: &Player) {
     p.set_to_end(c.add_to_end);
     p.set_wave_motion(c.wave_motion);
     p.set_crossfade(c.crossfade_secs > 0);
+    p.set_sources_connected(crate::resolver_login::credential().is_some());
     p.set_updates(c.check_updates);
     p.set_eq_on(c.eq_on);
     p.set_eq_preset(c.eq_preset.min(eq::PRESETS.len() - 1) as i32);
@@ -151,7 +152,23 @@ pub fn bind(ui: &App, player: &Player) {
         c.save();
     });
 
-    p.on_link(|id| {
+    let settings_ui = ui.as_weak();
+    p.on_link(move |id| {
+        if id == "external-sources" {
+            if crate::resolver_login::credential().is_some() {
+                crate::resolver_login::disconnect();
+                if let Some(ui) = settings_ui.upgrade() { ui.global::<Prof>().set_sources_connected(false); }
+            } else {
+                let weak = settings_ui.clone();
+                crate::resolver_login::connect(move |result| {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = weak.upgrade() { ui.global::<Prof>().set_sources_connected(result.is_ok()); }
+                        crate::toast(result.err().unwrap_or_else(|| "Внешние источники подключены".into()));
+                    });
+                });
+            }
+            return;
+        }
         let url = match id.as_str() {
             "plus" => "https://plus.yandex.ru/my".to_string(),
             "support" => SUPPORT_CHAT.into(),

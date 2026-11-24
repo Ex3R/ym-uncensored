@@ -21,6 +21,7 @@ mod landing;
 mod language;
 mod verification;
 mod originals;
+mod resolver_login;
 #[cfg(target_os = "linux")]
 mod mpris;
 mod net;
