@@ -93,6 +93,11 @@ use std::time::{Duration, Instant};
 slint::include_modules!();
 
 static UI: std::sync::OnceLock<slint::Weak<App>> = std::sync::OnceLock::new();
+static RESUMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn is_resumed() -> bool {
+    RESUMED.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Короткое сообщение над мини-плеером, с любого потока.
 pub fn toast(text: impl Into<String>) {
@@ -145,6 +150,20 @@ fn android_main(app: slint::android::AndroidApp) {
 /// а освобождённое аллокатор сразу отдаёт системе.
 fn on_lifecycle(event: &slint::android::android_activity::PollEvent<'_>) {
     use slint::android::android_activity::{MainEvent, PollEvent};
+    match event {
+        PollEvent::Main(MainEvent::Resume { .. }) => {
+            RESUMED.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(weak) = UI.get().cloned() {
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = weak.upgrade() { profile::connect_sources(&ui, false); }
+                });
+            }
+        }
+        PollEvent::Main(MainEvent::Pause | MainEvent::Stop | MainEvent::Destroy) => {
+            RESUMED.store(false, std::sync::atomic::Ordering::Release);
+        }
+        _ => {}
+    }
     if let PollEvent::Main(MainEvent::Stop | MainEvent::LowMemory) = event {
         IMAGES.with(|i| i.clear());
         // M_PURGE_ALL у scudo, Android 12+. На старых версиях вызов просто ничего не делает.
@@ -157,6 +176,8 @@ fn on_lifecycle(event: &slint::android::android_activity::PollEvent<'_>) {
 }
 
 fn run() -> Result<(), slint::PlatformError> {
+    let cfg = Config::load();
+    crate::resolver_login::set_mode_enabled(cfg.uncensor_enabled());
     let ui = App::new()?;
     let _ = UI.set(ui.as_weak());
     if let Some(top) = sys::status_bar_height() {
@@ -213,26 +234,6 @@ fn run() -> Result<(), slint::PlatformError> {
             logout(&ui, &p);
         });
     }
-    let mut cfg = Config::load();
-    let sources_connected = crate::resolver_login::credential().is_some();
-    if sources_connected && cfg.sources_setup.is_none() {
-        cfg.sources_setup = Some(true);
-        cfg.save();
-    }
-    ui.set_sources_requested(cfg.sources_setup == Some(true));
-    ui.set_sources_setup_open(!sources_connected && cfg.sources_setup != Some(false));
-    {
-        let weak = ui.as_weak();
-        ui.on_sources_choose(move |enabled| {
-            let Some(ui) = weak.upgrade() else { return };
-            let mut cfg = Config::load();
-            cfg.sources_setup = Some(enabled);
-            cfg.save();
-            ui.set_sources_requested(enabled);
-            ui.set_sources_setup_open(false);
-            if enabled && ui.get_logged_in() { profile::connect_sources(&ui); }
-        });
-    }
     api::QUALITY.store(cfg.quality, std::sync::atomic::Ordering::Relaxed);
     ui.global::<Now>().set_quality(quality_index(cfg.quality));
     if let Some(token) = cfg.token {
@@ -284,6 +285,10 @@ fn run() -> Result<(), slint::PlatformError> {
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(200), refresh);
 
+    let weak = ui.as_weak();
+    slint::Timer::single_shot(Duration::ZERO, move || {
+        if let Some(ui) = weak.upgrade() { profile::connect_sources(&ui, false); }
+    });
     ui.run()
 }
 
@@ -302,11 +307,16 @@ fn logged_in(ui: &App, token: &str, player: &Player) {
     });
     profile::start(ui, api);
     ui.set_logged_in(true);
+    profile::connect_sources(ui, false);
 }
 
 fn logout(ui: &App, player: &Player) {
     crate::resolver_login::disconnect();
-    ui.global::<Prof>().set_sources_connected(false);
+    let prof = ui.global::<Prof>();
+    prof.set_sources_connected(false);
+    prof.set_sources_pending(false);
+    prof.set_sources_attempted(false);
+    prof.set_sources_error("".into());
     player.send(Cmd::Logout);
     let mut c = Config::load();
     if let Some(token) = c.token.clone() {
@@ -590,10 +600,7 @@ fn start_login(ui: &App, player: Player) {
             Ok(c) => c,
             Err(e) => return set(String::new(), format!("Не удалось получить код: {e}")),
         };
-        let hint = if Config::load().sources_setup == Some(true) {
-            "Шаг 1 из 2: введите код на ya.ru/device. Затем откроется подключение версий без цензуры."
-        } else { "Введите код на ya.ru/device, чтобы войти в музыку." };
-        set(code.user_code.clone(), hint.into());
+        set(code.user_code.clone(), "Введите код на ya.ru/device, чтобы войти в музыку.".into());
         let deadline = std::time::Instant::now() + Duration::from_secs(code.expires_in);
         while std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_secs(code.interval));
@@ -601,20 +608,17 @@ fn start_login(ui: &App, player: Player) {
                 auth::Poll::Pending => continue,
                 auth::Poll::Failed(e) => return set(String::new(), e),
                 auth::Poll::Done(token) => {
-                    let mut c = Config::load();
-                    c.token = Some(token.access.clone());
-                    c.refresh_token = token.refresh;
-                    c.token_expires = token.expires_in.map(|s| config::now_secs() + s);
-                    c.save();
-                    player.send(Cmd::Login(token.access.clone()));
                     let weak = weak.clone();
                     let player = player.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak.upgrade() {
+                            let mut c = Config::load();
+                            c.token = Some(token.access.clone());
+                            c.refresh_token = token.refresh;
+                            c.token_expires = token.expires_in.map(|s| config::now_secs() + s);
+                            c.save();
+                            player.send(Cmd::Login(token.access.clone()));
                             logged_in(&ui, &token.access, &player);
-                            if Config::load().sources_setup == Some(true) && crate::resolver_login::credential().is_none() {
-                                profile::connect_sources(&ui);
-                            }
                         }
                     });
                     return;

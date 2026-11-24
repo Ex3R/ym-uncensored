@@ -44,8 +44,16 @@ pub fn hostname() -> Option<String> {
 
 /// Открыть адрес в браузере.
 pub fn open_url(url: &str) {
-    let Some(url) = crate::client::browser_url(url) else { return };
-    let ok = with_env(|env, activity| {
+    if !open_browser(url, || true) { crate::config::log("не удалось открыть браузер"); }
+}
+
+pub fn open_sources_login(url: &str) -> bool {
+    open_browser(url, || crate::is_resumed() && crate::resolver_login::mode_enabled())
+}
+
+fn open_browser(url: &str, can_open: impl FnOnce() -> bool) -> bool {
+    let Some(url) = crate::client::browser_url(url) else { return false };
+    with_env(|env, activity| {
         let text = env.new_string(&url)?;
         let uri = env
             .call_static_method("android/net/Uri", "parse", "(Ljava/lang/String;)Landroid/net/Uri;", &[JValue::Object(&text)])?
@@ -58,12 +66,10 @@ pub fn open_url(url: &str) {
         )?;
         const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
         env.call_method(&intent, "addFlags", "(I)Landroid/content/Intent;", &[JValue::Int(FLAG_ACTIVITY_NEW_TASK)])?;
+        if !can_open() { return Ok(false); }
         env.call_method(activity, "startActivity", "(Landroid/content/Intent;)V", &[JValue::Object(&intent)])?;
-        Ok(())
-    });
-    if ok.is_none() {
-        crate::config::log(format!("не удалось открыть {url}"));
-    }
+        Ok(true)
+    }).unwrap_or(false)
 }
 
 /// Отдать ссылку системному «Поделиться».

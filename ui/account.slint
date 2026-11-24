@@ -477,9 +477,16 @@ export component SettingsPage inherits Rectangle {
                 clicked => { App.setting("autostart"); }
             }
             SettingItem {
-                title: T.t("Внешние источники");
-                desc: App.sources-connected ? T.t("Подключены · отключить") : T.t("Подключить через Яндекс ID");
-                clicked => { App.setting("external-sources"); }
+                title: T.t("Только обычный плеер");
+                desc: T.t("Воспроизводить исходные записи без подбора замен");
+                toggle: true;
+                on: App.ordinary-player;
+                clicked => { App.setting("ordinary-player"); }
+            }
+            if !App.ordinary-player && App.sources-retry && !App.sources-connected: SettingItem {
+                title: T.t("Повторить вход в Яндекс ID");
+                desc: T.t("Для подбора версий без цензуры");
+                clicked => { App.setting("sources-retry"); }
             }
             SettingItem {
                 title: T.t("Проверять обновления");
@@ -541,7 +548,7 @@ export component LoginScreen inherits Rectangle {
         }
         Rectangle { height: 32px; }
         Text {
-            text: App.sources-requested ? "Шаг 1 из 2 · вход в музыку" : "Вход в музыку";
+            text: T.t("Вход в музыку");
             horizontal-alignment: center;
             font-family: "YS Music Headline";
             font-size: Theme.font-size-headline-xl;
@@ -612,6 +619,15 @@ export component LoginScreen inherits Rectangle {
                 text: T.t("Получить новый код");
                 clicked => { App.login-start(); }
             }
+        }
+        Rectangle { height: 16px; }
+        SettingItem {
+            title: T.t("Только обычный плеер");
+            desc: App.ordinary-player ? T.t("Воспроизводить исходные записи без подбора замен")
+                : T.t("После входа Яндекс ID подтвердит доступ к подбору версий");
+            toggle: true;
+            on: App.ordinary-player;
+            clicked => { App.setting("ordinary-player"); }
         }
         Rectangle { height: 20px; }
         if App.login-code != "": Text {
