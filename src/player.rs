@@ -920,6 +920,12 @@ impl Engine {
         }
     }
 
+    fn playback_position(&self) -> f32 {
+        if self.loaded { return self.pos(); }
+        self.resume_at.as_ref().filter(|(id, _)| self.current.as_ref().is_some_and(|t| t.id == *id))
+            .map_or(0.0, |(_, position)| *position)
+    }
+
     /// Звук открыт на одном устройстве и сам за выходом Windows не переходит. Раз в секунду
     /// сверяем выход по умолчанию: сменился или пропал — переоткрываем.
     #[cfg(windows)]
@@ -1260,7 +1266,7 @@ impl Engine {
     /// Состояние движка → Shared для UI.
     fn sync(&mut self) {
         let playing = self.loaded && !self.paused && self.sink().map(|s| !s.is_paused()).unwrap_or(false);
-        let pos = if self.loaded { self.pos() } else { 0.0 };
+        let pos = self.playback_position();
         let upcoming: Vec<Track> = self.queue.iter().take(30).cloned().collect();
         let mut s = self.shared.lock().unwrap();
         s.playing = playing;
@@ -2316,7 +2322,7 @@ impl Engine {
             from: self.play_context().from,
             tracks: tracks.iter().map(playable).collect(),
             index,
-            progress_ms: if self.loaded { (self.pos() * 1000.0) as u64 } else { 0 },
+            progress_ms: (self.playback_position() * 1000.0) as u64,
             duration_ms: current.duration_ms,
             paused: self.paused,
             session: if self.list.is_none() { self.session.clone() } else { String::new() },
@@ -2552,6 +2558,7 @@ mod tests {
         assert!(engine.paused_start.is_some());
         assert!(!engine.loaded);
         assert!(engine.audio.is_none());
+        assert_eq!(engine.ynison_now().unwrap().progress_ms, 12_000);
         let stale = Arc::new(());
         engine.handle(Msg::KnownFinished { owner: Arc::downgrade(&stale), revision, audio: Some(make_audio("stale")) });
         assert!(engine.paused_start.is_some());
