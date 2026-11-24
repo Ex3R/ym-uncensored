@@ -26,6 +26,12 @@ fn valid(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|c| c.is_ascii_hexdigit())
 }
 
+static SESSION_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn session_revision() -> u64 {
+    SESSION_REVISION.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub fn credential() -> Option<String> {
     let value = std::fs::read_to_string(crate::config::dir().join(NAME)).ok()?;
     let token = if cfg!(any(target_os = "linux", target_os = "android")) && valid(&value) {
@@ -46,7 +52,9 @@ fn save(token: &str) -> Result<(), String> {
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
-    options.open(dir.join(NAME)).and_then(|mut f| f.write_all(value.as_bytes())).map_err(|e| e.to_string())
+    options.open(dir.join(NAME)).and_then(|mut f| f.write_all(value.as_bytes())).map_err(|e| e.to_string())?;
+    SESSION_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
+    Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
@@ -94,6 +102,7 @@ pub fn disconnect() {
     let token = credential();
     let _ = std::fs::remove_file(crate::config::dir().join(NAME));
     crate::secret::forget(NAME);
+    SESSION_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
     if let Some(token) = token {
         std::thread::spawn(move || {
             if let Ok(request) = signed("POST", "/auth/logout", &token, vec![]) { let _ = request.send(); }

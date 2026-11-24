@@ -113,6 +113,8 @@ fn transcript(pcm: &[i16]) -> Option<Vec<String>> {
     let external = SPEECH_MODEL.get_or_init(|| {
         whisper_rs::install_logging_hooks();
         let path = crate::config::dir().join("ggml-small-q5_1.bin");
+        #[cfg(test)]
+        let path = std::env::var_os("YM_VERIFICATION_MODEL").map(std::path::PathBuf::from).unwrap_or(path);
         if !path.is_file() {
             #[cfg(target_os = "android")]
             return crate::sys::speech_model().map(Mutex::new);
@@ -307,6 +309,9 @@ mod tests {
         assert_eq!(compare(&baseline, &baseline, &lyrics), None);
         assert_eq!(compare(&baseline, &read(dir.join("groupie-recoded.mp3")), &lyrics), None);
         assert_eq!(compare(&alternative, &baseline, &lyrics), None);
+        if let Some(path) = std::env::var_os("YM_EXTERNAL_UNCONFIRMED") {
+            assert_eq!(compare(&baseline, &read(path.into()), &lyrics), None);
+        }
         let restored = compare(&baseline, &alternative, &lyrics);
         eprintln!("external recording: restored speech at {restored:?}");
         assert!(restored.is_some());
