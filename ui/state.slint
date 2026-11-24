@@ -181,6 +181,9 @@ export global App {
     // Установщик скачивается.
     in property <bool> update-busy;
     in property <bool> sources-connected;
+    in property <bool> sources-setup-open;
+    in property <bool> sources-requested;
+    callback sources-choose(bool);
     callback update-install();
     // «Что изменилось»: сравнение запущенной и новой версии на GitHub.
     callback update-changes();

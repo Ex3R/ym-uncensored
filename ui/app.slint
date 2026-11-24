@@ -11,6 +11,7 @@ import { SearchPage } from "search.slint";
 import { ArtistPage } from "artist.slint";
 import { MyArtistsPage } from "artists.slint";
 import { GridPage } from "grid.slint";
+import { SourceSetup } from "source-setup.slint";
 import { AccountMenu, SettingsPage, LoginScreen } from "account.slint";
 import { FullscreenPlayer } from "fullscreen.slint";
 import { TrackMenu, SoundSettings } from "popups.slint";
@@ -400,6 +401,16 @@ export component AppWindow inherits Window {
         y: 0;
         width: parent.width;
         height: parent.height;
+    }
+
+    if App.sources-setup-open: SourceSetup {
+        width: parent.width;
+        height: parent.height;
+        music-connected: !App.logged-out;
+        background-color: Theme.background-color-primary-enabled-basic;
+        ink: Theme.controls-color-primary-text-enabled-variant;
+        secondary-ink: Theme.controls-color-primary-text-enabled;
+        selected(enabled) => { App.sources-choose(enabled); }
     }
 
     // Почти прозрачный фон обязателен: пустой Rectangle Slint не рисует и место не обновит.

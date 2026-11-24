@@ -5,6 +5,8 @@ edition = "2021"
 rust-version = "1.92"
 license = "GPL-3.0-only"
 repository = "https://github.com/Ex3R/ym-uncensored"
+homepage = "https://ym.idkroma.ru"
+description = "YM UNCENSORED — неофициальный клиент Яндекс Музыки для Android"
 publish = false
 
 # Общий код (API, вход, плеер) берётся из ../src через #[path], своего у Android только окно и sys.

@@ -1,4 +1,4 @@
-//! Яндекс Музыка RS для Android. Общий с десктопом код (API, вход, плеер волны) берётся
+//! YM UNCENSORED для Android. Общий с десктопом код (API, вход, плеер волны) берётся
 //! из ../src, здесь только окно, системные вызовы и фон «Моей волны».
 
 #[path = "../../src/ahead.rs"]
@@ -213,7 +213,26 @@ fn run() -> Result<(), slint::PlatformError> {
             logout(&ui, &p);
         });
     }
-    let cfg = Config::load();
+    let mut cfg = Config::load();
+    let sources_connected = crate::resolver_login::credential().is_some();
+    if sources_connected && cfg.sources_setup.is_none() {
+        cfg.sources_setup = Some(true);
+        cfg.save();
+    }
+    ui.set_sources_requested(cfg.sources_setup == Some(true));
+    ui.set_sources_setup_open(!sources_connected && cfg.sources_setup != Some(false));
+    {
+        let weak = ui.as_weak();
+        ui.on_sources_choose(move |enabled| {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut cfg = Config::load();
+            cfg.sources_setup = Some(enabled);
+            cfg.save();
+            ui.set_sources_requested(enabled);
+            ui.set_sources_setup_open(false);
+            if enabled && ui.get_logged_in() { profile::connect_sources(&ui); }
+        });
+    }
     api::QUALITY.store(cfg.quality, std::sync::atomic::Ordering::Relaxed);
     ui.global::<Now>().set_quality(quality_index(cfg.quality));
     if let Some(token) = cfg.token {
@@ -571,7 +590,10 @@ fn start_login(ui: &App, player: Player) {
             Ok(c) => c,
             Err(e) => return set(String::new(), format!("Не удалось получить код: {e}")),
         };
-        set(code.user_code.clone(), "Введите код на ya.ru/device. Затем подтвердите поиск версий без цензуры через Яндекс ID.".into());
+        let hint = if Config::load().sources_setup == Some(true) {
+            "Шаг 1 из 2: введите код на ya.ru/device. Затем откроется подключение версий без цензуры."
+        } else { "Введите код на ya.ru/device, чтобы войти в музыку." };
+        set(code.user_code.clone(), hint.into());
         let deadline = std::time::Instant::now() + Duration::from_secs(code.expires_in);
         while std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_secs(code.interval));
@@ -590,7 +612,7 @@ fn start_login(ui: &App, player: Player) {
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak.upgrade() {
                             logged_in(&ui, &token.access, &player);
-                            if crate::resolver_login::credential().is_none() && crate::api::allow_explicit() {
+                            if Config::load().sources_setup == Some(true) && crate::resolver_login::credential().is_none() {
                                 profile::connect_sources(&ui);
                             }
                         }

@@ -156,3 +156,6 @@ dialog .donate { display:block; width:100%; text-align:center; padding:13px; bac
 dialog .skip { margin-top:5px; }
 dialog .retry { margin-top:8px; }
 @media(max-width:430px){.cuts{gap:3px}.cuts-head{font-size:12px}.cut-times{gap:4px}.cut-times button{min-height:34px}.listen-tip:not([hidden]){flex-wrap:wrap}}
+
+.provenance { color: var(--muted); font-size: 13px; line-height: 1.65; margin: 24px 0 0; }
+@media (max-width: 560px) { header { height: auto; min-height: 65px; padding: 12px 0; flex-wrap: wrap; gap: 12px; } }

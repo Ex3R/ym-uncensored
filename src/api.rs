@@ -1705,25 +1705,29 @@ impl Api {
         self.lyrics_until(track_id, None)
     }
 
-    /// A recording-specific lookup for language identification. Never attach account headers.
-    pub(crate) fn reference_lyrics(&self, track: &Track) -> Option<Lyrics> {
+    /// A public reference for this recording, requested under the separate sources session.
+    pub(crate) fn reference_lyrics(&self, track: &Track) -> Res<Option<Lyrics>> {
+        use std::io::Read;
+        let Some(session) = crate::resolver_login::credential() else { return Ok(None) };
         if track.artists.is_empty() || track.album_title.is_empty() || !track.version.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let seconds = ((track.duration_ms + 500) / 1000).to_string();
-        let response: Value = self.http.get("https://lrclib.net/api/get")
-            .header("User-Agent", "YM UNCENSORED (https://github.com/Ex3R/ym-uncensored)")
-            .timeout(Duration::from_millis(1500))
-            .query(&[("track_name", &track.title), ("artist_name", &track.artists),
-                ("album_name", &track.album_title), ("duration", &seconds)])
-            .send().ok()?.error_for_status().ok()?.json().ok()?;
-        for (field, expected) in [("trackName", &track.title), ("artistName", &track.artists), ("albumName", &track.album_title)] {
-            if response[field].as_str()?.trim().to_lowercase() != expected.trim().to_lowercase() { return None; }
-        }
-        if (response["duration"].as_f64()? * 1000.0 - track.duration_ms as f64).abs() > 2000.0 { return None; }
-        let lines = response["plainLyrics"].as_str()?.lines().map(str::to_owned).collect();
-        let synced = parse_lrc(response["syncedLyrics"].as_str().unwrap_or(""));
-        Some(Lyrics { text: lines, synced, ..Default::default() })
+        let body = serde_json::to_vec(&json!({
+            "title":track.title, "artists":track.artist_list.iter().map(|a| &a.name).collect::<Vec<_>>(),
+            "duration_ms":track.duration_ms,
+        })).map_err(|e| e.to_string())?;
+        let response = crate::resolver_login::signed("POST", "/reference", &session, body)?
+            .timeout(Duration::from_secs(15)).send().map_err(|e| e.to_string())?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND { return Ok(None); }
+        let response = response.error_for_status().map_err(|e| e.to_string())?;
+        let editions: Vec<Value> = serde_json::from_reader(response.take(262145)).map_err(|e| e.to_string())?;
+        let album = track.album_title.trim().to_lowercase();
+        let Some(data) = editions.iter().filter(|row| row["albumName"].as_str()
+            .is_some_and(|name| name.trim().to_lowercase() == album))
+            .max_by_key(|row| row["syncedLyrics"].as_str().is_some_and(|text| !text.is_empty())) else { return Ok(None) };
+        let text = data["plainLyrics"].as_str().unwrap_or("").lines().map(str::to_owned).collect();
+        let synced = parse_lrc(data["syncedLyrics"].as_str().unwrap_or(""));
+        Ok(Some(Lyrics { text, synced, ..Default::default() }))
     }
 
     pub(crate) fn lyrics_until(&self, track_id: &str, deadline: Option<Instant>) -> Res<Lyrics> {

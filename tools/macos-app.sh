@@ -1,5 +1,5 @@
 #!/bin/bash
-# Собирает «Яндекс Музыка RS.app» из релизной сборки: Info.plist, значок, ad-hoc подпись.
+# Собирает «YM UNCENSORED.app» из релизной сборки: Info.plist, значок, ad-hoc подпись.
 #
 #   tools/macos-app.sh                    # нативная сборка (arm64 на Apple Silicon)
 #   tools/macos-app.sh --universal        # arm64 + x86_64 одним бинарём (lipo)
@@ -97,7 +97,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSApplicationCategoryType</key><string>public.app-category.music</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSRequiresAquaSystemAppearance</key><false/>
-  <key>NSHumanReadableCopyright</key><string>GPL-3.0, неофициальный клиент</string>
+  <key>NSHumanReadableCopyright</key><string>© 2026 Spolzer and contributors; © 2026 Ex3R (YM UNCENSORED). GPL-3.0-only. https://ym.idkroma.ru</string>
 </dict>
 </plist>
 PLIST

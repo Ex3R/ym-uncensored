@@ -140,6 +140,9 @@ fn authorize(generation: u64) -> Result<(), String> {
         std::thread::sleep(Duration::from_secs(3));
         if STATE.lock().unwrap().generation != generation { return Err("Вход отменён".into()); }
         if let Ok(r) = signed("GET", "/auth/status", &pair.token, vec![])?.send() {
+            if matches!(r.status(), reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::GONE) {
+                return Err("Подключение отменено. Можно пользоваться обычным плеером".into());
+            }
             if r.status() == reqwest::StatusCode::NO_CONTENT {
                 let state = STATE.lock().unwrap();
                 if state.generation == generation { return save(&pair.token); }

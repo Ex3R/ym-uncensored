@@ -102,7 +102,7 @@ pub fn install(handler: impl Fn(Event) + 'static) {
         // Готовый системный символ: выглядит родным и сам подстраивается под светлую и тёмную тему.
         let icon = NSImage::imageWithSystemSymbolName_accessibilityDescription(
             &NSString::from_str("music.note"),
-            Some(&NSString::from_str("Яндекс Музыка RS")),
+            Some(&NSString::from_str("YM UNCENSORED")),
         );
         if let Some(icon) = icon {
             icon.setTemplate(true);

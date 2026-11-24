@@ -10,8 +10,7 @@ use std::rc::Rc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
-const SUPPORT_CHAT: &str =
-    "https://yandex.ru/chat?context=%7B%22entrypoint%22%3A%22web_desktop%22%7D#/user/ee219503-b69b-9484-405b-6877a510e13c";
+const SUPPORT_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/issues");
 
 thread_local! {
     static API: RefCell<Option<Arc<Api>>> = const { RefCell::new(None) };
@@ -19,6 +18,10 @@ thread_local! {
 }
 
 pub(crate) fn connect_sources(ui: &App) {
+    let mut cfg = Config::load();
+    cfg.sources_setup = Some(true);
+    cfg.save();
+    ui.set_sources_requested(true);
     let weak = ui.as_weak();
     crate::resolver_login::connect(move |result| {
         let _ = slint::invoke_from_event_loop(move || {
@@ -168,8 +171,11 @@ pub fn bind(ui: &App, player: &Player) {
     p.on_link(move |id| {
         if id == "external-sources" {
             if crate::resolver_login::credential().is_some() {
+                let mut cfg = Config::load();
+                cfg.sources_setup = Some(false);
+                cfg.save();
                 crate::resolver_login::disconnect();
-                if let Some(ui) = settings_ui.upgrade() { ui.global::<Prof>().set_sources_connected(false); }
+                if let Some(ui) = settings_ui.upgrade() { ui.global::<Prof>().set_sources_connected(false); ui.set_sources_requested(false); }
             } else {
                 if let Some(ui) = settings_ui.upgrade() { connect_sources(&ui); }
             }
@@ -177,14 +183,15 @@ pub fn bind(ui: &App, player: &Player) {
         }
         let url = match id.as_str() {
             "plus" => "https://plus.yandex.ru/my".to_string(),
-            "support" => SUPPORT_CHAT.into(),
+            "support" => SUPPORT_URL.into(),
+            "website" => env!("CARGO_PKG_HOMEPAGE").into(),
             "account" => "https://id.yandex.ru/personal".into(),
-            "help" => "https://yandex.ru/support/music-app-android/".into(),
+            "help" => SUPPORT_URL.into(),
             "donate" => "https://pay.cloudtips.ru/p/567e5376".into(),
             "terms" => "https://yandex.ru/legal/music_mobile_agreement/".into(),
             "privacy" => "https://yandex.ru/legal/confidential/".into(),
             "recommendations" => "https://music.yandex.ru/legal/recommendations/ru/#music".into(),
-            "components" => env!("CARGO_PKG_REPOSITORY").into(),
+            "components" => concat!(env!("CARGO_PKG_REPOSITORY"), "#source-and-licenses").into(),
             "update" => RELEASE_PAGE.with(|r| r.borrow().clone()),
             _ => return,
         };

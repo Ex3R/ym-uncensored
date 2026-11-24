@@ -6,6 +6,7 @@ rust-version = "1.92"
 license = "GPL-3.0-only"
 description = "YM UNCENSORED — неофициальный клиент Яндекс Музыки с проверенными версиями треков"
 repository = "https://github.com/Ex3R/ym-uncensored"
+homepage = "https://ym.idkroma.ru"
 
 [dependencies]
 skia-safe = { version = "0.153.3", default-features = false }
@@ -103,10 +104,10 @@ panic = "unwind"
 # Пакет для Debian и Ubuntu: `cargo deb` (cargo install cargo-deb).
 # X11, Wayland и xkbcommon winit открывает сам во время работы, dpkg-shlibdeps их не видит.
 [package.metadata.deb]
-maintainer = "Spolzer <132726602+SpolzerMod@users.noreply.github.com>"
-copyright = "2026 Spolzer"
+maintainer = "Ex3R <12800974+Ex3R@users.noreply.github.com>"
+copyright = "2026 Spolzer and contributors; 2026 Ex3R (YM UNCENSORED modifications)"
 section = "sound"
-extended-description = "Неофициальный клиент Яндекс Музыки на Rust и Slint, без Electron."
+extended-description = "YM UNCENSORED — неофициальный клиент Яндекс Музыки с подбором версий треков без цензуры. Сайт: https://ym.idkroma.ru"
 depends = "$auto, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi6, libxcb1, libxcb-shm0, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0"
 recommends = "xdg-utils, zenity | kdialog"
 assets = [
@@ -123,7 +124,7 @@ assets = [
 # cargo generate-rpm: пакет для Fedora и openSUSE. Библиотеки окна winit открывает сам,
 # поэтому они указаны по soname: так зависимость понимают обе системы.
 [package.metadata.generate-rpm]
-summary = "Неофициальный клиент Яндекс Музыки"
+summary = "YM UNCENSORED — неофициальный клиент Яндекс Музыки"
 require-sh = false
 assets = [
     { source = "target/release/yamusic-rs", dest = "/usr/bin/yamusic-rs", mode = "755" },

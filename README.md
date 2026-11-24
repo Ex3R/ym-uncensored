@@ -19,4 +19,14 @@
 
 **macOS** для Apple Silicon и Intel · **Windows** x64 · **Linux** x86_64 и ARM64 · **Android** 8+ на ARM64. [Все сборки на GitHub](https://github.com/Ex3R/ym-uncensored/releases/latest)
 
+<a id="source-and-licenses"></a>
+
+## Исходный код и лицензии
+
+Сайт и загрузки YM UNCENSORED: [ym.idkroma.ru](https://ym.idkroma.ru). Форк сопровождает [Ex3R](https://github.com/Ex3R). [Исходный код](https://github.com/Ex3R/ym-uncensored) · [Обратная связь](https://github.com/Ex3R/ym-uncensored/issues) · [Сообщить об уязвимости](SECURITY.md).
+
 Проект основан на [yamusic-rs](https://github.com/SpolzerMod/yamusic-rs) и его [порте для macOS](https://github.com/M1kage-dev/yamusic-rs). [Лицензия GPL-3.0-only](LICENSE)
+
+Автор исходного yamusic-rs — Spolzer (SpolzerMod); порт для macOS — M1kage-dev. Изменения YM UNCENSORED — Ex3R. Авторство исходного кода и история Git сохранены; старые публичные релизы остаются доступны. Архивный [README исходного проекта](docs/upstream-readme-v1.1.2.md) описывает прежний продукт.
+
+Лицензии встроенных моделей и сторонних компонентов: [models/README.md](models/README.md), [русский словарь](models/RUSSIAN-DICTIONARY-LICENSE), [Whisper](models/WHISPER-LICENSE). Условия сервиса Яндекс Музыки принадлежат Яндексу и не заменяют лицензию кода форка.

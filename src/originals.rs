@@ -53,30 +53,65 @@ fn recording(title: &str, artists: impl Iterator<Item = String>) -> Option<(Stri
 
 pub fn verified(api: &Api, original: &crate::verification::Recording, candidate: &crate::verification::Recording, lyrics: &crate::api::Lyrics) -> Option<f32> {
     if lyrics.synced.is_empty() && lyrics.text.is_empty() { return None; }
-    let key = format!("{:02x?}/{:02x?}", original.digest, candidate.digest);
-    api.originals.verified.find(&key, || Ok(crate::verification::compare(original, candidate, lyrics)))
+    // A positive proof is specific to both decoded recordings, their order and the lyrics used.
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(original.digest);
+    hash.update(candidate.digest);
+    for line in &lyrics.synced {
+        hash.update(line.from.to_bits().to_le_bytes());
+        hash.update(line.to.map(f32::to_bits).unwrap_or(u32::MAX).to_le_bytes());
+        hash.update((line.text.len() as u64).to_le_bytes());
+        hash.update(line.text.as_bytes());
+    }
+    if lyrics.synced.is_empty() {
+        for line in &lyrics.text {
+            hash.update((line.len() as u64).to_le_bytes());
+            hash.update(line.as_bytes());
+        }
+    }
+    let key = format!("{:x}", hash.finalize());
+    api.originals.verified.find(&key, || {
+        // One record per bucket bounds the disk cache even for a long-lived installation.
+        let dir = crate::config::cache_dir().join("restored-speech-v1");
+        let path = dir.join(&key[..2]);
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok((saved, time)) = serde_json::from_slice::<(String, f32)>(&bytes) {
+                if saved == key && time.is_finite() && time >= 0.0 {
+                    return Ok(Some(time));
+                }
+            }
+        }
+        let time = crate::verification::compare(original, candidate, lyrics);
+        if let Some(time) = time {
+            let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+            if std::fs::create_dir_all(&dir).is_ok() &&
+                std::fs::write(&temp, serde_json::to_vec(&(&key, time)).unwrap_or_default()).is_ok() {
+                let _ = std::fs::rename(&temp, &path);
+                let _ = std::fs::remove_file(&temp);
+            }
+        }
+        Ok(time)
+    })
 }
 
 fn can_match(track: &Track) -> bool {
     track.duration_ms > 0 && !track.id.is_empty() && track.id.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-pub fn should_uncensor(api: &Api, track: &Track, vocals: impl FnOnce() -> Option<bool>) -> bool {
+pub fn should_uncensor(
+    api: &Api, track: &Track, text_language: impl FnOnce() -> Res<Option<bool>>,
+    vocals: impl FnOnce() -> Option<bool>,
+) -> bool {
     if !can_match(track) { return false; }
     let title = normalized(&track.title);
     if crate::language::russian_title(title_variant(&title).0) { return true; }
     api.originals.russian.find(&track.id, || {
-        if track.lyrics {
-            let deadline = Instant::now() + Duration::from_millis(1500);
-            if let Ok(lyrics) = api.lyrics_until(&track.id, Some(deadline)) {
-                if let Some(russian) = crate::language::lyrics_language(&lyrics) {
-                    return Ok(Some(russian));
-                }
-            }
-        }
-        if title.chars().any(|c| matches!(c, 'а'..='я' | 'ё')) {
-            if let Some(russian) = api.reference_lyrics(track).as_ref().and_then(crate::language::lyrics_language) {
-                return Ok(Some(russian));
+        if track.lyrics || title.chars().any(|c| matches!(c, 'а'..='я' | 'ё')) {
+            match text_language() {
+                Ok(Some(russian)) => return Ok(Some(russian)),
+                Err(e) => return if vocals() == Some(true) { Ok(Some(true)) } else { Err(e) },
+                Ok(None) => {}
             }
         }
         vocals().map(Some).ok_or_else(|| "язык не определён".into())
@@ -201,13 +236,13 @@ mod tests {
         let make = |id, title| crate::api::parse_track(&serde_json::json!({
             "id": id, "title": title, "durationMs": 120000, "artists": [{"id": 1, "name": "Русский артист"}]
         })).unwrap();
-        assert!(should_uncensor(&api, &make(1, "Счастье"), || panic!("clear title")));
-        assert!(should_uncensor(&api, &make(2, "Cadillac"), || Some(true)));
+        assert!(should_uncensor(&api, &make(1, "Счастье"), || Ok(None), || panic!("clear title")));
+        assert!(should_uncensor(&api, &make(2, "Cadillac"), || Ok(None), || Some(true)));
         let foreign = make(3, "Without Me");
-        assert!(!should_uncensor(&api, &foreign, || Some(false)));
-        assert!(!should_uncensor(&api, &foreign, || panic!("cached foreign language")));
+        assert!(!should_uncensor(&api, &foreign, || Ok(None), || Some(false)));
+        assert!(!should_uncensor(&api, &foreign, || Ok(None), || panic!("cached foreign language")));
         let unknown = make(4, "Instrumental");
-        assert!(!should_uncensor(&api, &unknown, || None));
+        assert!(!should_uncensor(&api, &unknown, || Ok(None), || None));
     }
 
     #[test]

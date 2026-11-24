@@ -362,28 +362,38 @@ fn load_track(api: &Api, t: &Track) -> Res<Audio> {
     load_audio(api, &t.id)
 }
 
-fn resolve_track(api: &Api, t: &Track, buf: Arc<Buf>) -> Option<Audio> {
-    let mut original = Some((buf.clone(), open_decoder(&buf).ok()?, String::new()));
-    let eligible = crate::api::allow_explicit() && crate::originals::should_uncensor(api, t, || {
-        crate::language::vocal_language(open_decoder(&buf).ok()?, t.duration_ms)
-    });
+fn resolve_track(
+    api: &Api, t: &Track, buf: Arc<Buf>, current: &impl Fn() -> bool, retry: &std::cell::Cell<bool>,
+) -> Option<Audio> {
+    use crate::{originals, verification::Recording};
+    let lyrics = std::cell::OnceCell::new();
+    let reference_text = || lyrics.get_or_init(|| {
+        let result = api.reference_lyrics(t);
+        if let Ok(Some(_)) = &result { return result; }
+        if t.lyrics {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            match api.lyrics_until(&t.id, Some(deadline)) {
+                Ok(found) if !found.text.is_empty() || !found.synced.is_empty() => return Ok(Some(found)),
+                Err(e) => return Err(e),
+                _ => {}
+            }
+        }
+        result
+    }).as_ref().map_err(|e| { retry.set(true); e.clone() });
+    let eligible = current() && crate::api::allow_explicit() && originals::should_uncensor(api, t,
+        || reference_text().map(|l| l.as_ref().and_then(crate::language::lyrics_language)),
+        || crate::language::vocal_language(open_decoder(&buf).ok()?, t.duration_ms));
     if eligible {
         log(format!("Замена {}: подбор", t.id));
-        use crate::{originals, verification::Recording};
         let baseline = std::cell::OnceCell::new();
-        let lyrics = std::cell::OnceCell::new();
-        let mut check = |candidate: Audio| -> Option<Audio> {
-            if original.is_none() {
-                original = Some(load_audio(api, &t.id).ok()?);
-            }
-            let audio = original.as_ref()?;
-            let reference = baseline.get_or_init(|| Recording::decode(open_decoder(&audio.0).ok()?, t.duration_ms)).as_ref().or_else(|| { log("Замена: исходное аудио не декодировано"); None })?;
+        let check = |candidate: Audio| -> Option<Audio> {
+            if !current() { return None; }
+            let reference = baseline.get_or_init(|| Recording::decode(open_decoder(&buf).ok()?, t.duration_ms)).as_ref().or_else(|| { log("Замена: исходное аудио не декодировано"); None })?;
             let alternative = Recording::decode(open_decoder(&candidate.0).ok()?, t.duration_ms)
                 .or_else(|| { log("Замена: не удалось прочитать альтернативную запись"); None })?;
             if reference.digest == alternative.digest { return None; }
-            let lyrics = lyrics.get_or_init(|| api.reference_lyrics(t).or_else(|| {
-                t.lyrics.then(|| api.lyrics_until(&t.id, Some(std::time::Instant::now() + Duration::from_millis(1500))).ok()).flatten()
-            })).as_ref().or_else(|| { log("Замена: отсутствует текст для проверки"); None })?;
+            let lyrics = reference_text().ok()?.as_ref().or_else(|| { log("Замена: отсутствует текст для проверки"); None })?;
+            if !current() { return None; }
             let time = originals::verified(api, reference, &alternative, lyrics)
                 .or_else(|| { log("Замена: изменения вокала не подтверждены"); None })?;
             log(format!("Подтверждена замена {} на {:.1} с", t.id, time));
@@ -391,19 +401,21 @@ fn resolve_track(api: &Api, t: &Track, buf: Arc<Buf>) -> Option<Audio> {
         };
         let mut seen = std::collections::HashSet::new();
         let mut try_yandex = |id: &str, label: &str| {
-            if !seen.insert(id.to_owned()) { return None; }
+            if !current() || !seen.insert(id.to_owned()) { return None; }
             let (buf, decoder, format) = load_audio(api, id).ok()?;
             check((buf, decoder, format!("{format} · {label}")))
         };
         for id in originals::catalog_versions(api, t) {
             if let Some(audio) = try_yandex(&id, "Без цензуры") { return Some(audio); }
         }
-        let candidates = originals::online_candidates(t).inspect_err(|_| log("Замена: внешний поиск недоступен")).unwrap_or_default();
+        if !current() { return None; }
+        let candidates = originals::online_candidates(t).inspect_err(|_| { retry.set(true); log("Замена: внешний поиск недоступен"); }).unwrap_or_default();
         log(format!("Замена {}: внешних кандидатов {}", t.id, candidates.len()));
         let next = candidates.first().and_then(|candidate| candidate.next.clone());
-        let mut try_external = |candidates: Vec<originals::OnlineCandidate>| {
+        let try_external = |candidates: Vec<originals::OnlineCandidate>| {
             for candidate in candidates {
-                if let Ok((buf, format)) = originals::online_audio(&candidate).inspect_err(|_| log("Замена: ошибка загрузки аудио")) {
+                if !current() { return None; }
+                if let Ok((buf, format)) = originals::online_audio(&candidate).inspect_err(|_| { retry.set(true); log("Замена: ошибка загрузки аудио"); }) {
                     if let Ok(decoder) = open_decoder(&buf) {
                         if let Some(audio) = check((buf, decoder, format)) { return Some(audio); }
                     }
@@ -412,8 +424,9 @@ fn resolve_track(api: &Api, t: &Track, buf: Arc<Buf>) -> Option<Audio> {
             None
         };
         if let Some(audio) = try_external(candidates) { return Some(audio); }
+        if !current() { return None; }
         if let Some(next) = next {
-            if let Some(audio) = try_external(originals::online_next(&next).unwrap_or_default()) { return Some(audio); }
+            if let Some(audio) = try_external(originals::online_next(&next).inspect_err(|_| retry.set(true)).unwrap_or_default()) { return Some(audio); }
         }
     }
     None
@@ -542,6 +555,7 @@ struct Engine {
     pending_replacement: Arc<Mutex<Option<Job>>>,
     replacement_wakeup: mpsc::SyncSender<()>,
     lookup_started: Option<(u64, u64)>,
+    lookup_generation: Arc<std::sync::atomic::AtomicU64>,
     current_buf: Option<Arc<Buf>>,
     batch_id: String,
     /// Сессия ротора текущей волны; radioStarted уходит в неё, когда она появится.
@@ -639,6 +653,7 @@ impl Engine {
             pending_replacement,
             replacement_wakeup,
             lookup_started: None,
+            lookup_generation: Default::default(),
             batch_id: String::new(),
             session: String::new(),
             radio_started_pending: false,
@@ -1986,8 +2001,21 @@ impl Engine {
         let credential = crate::resolver_login::credential();
         let tx = self.tx.clone();
         self.lookup_started = Some((gen, revision));
+        use std::sync::atomic::Ordering;
+        let generation = self.lookup_generation.clone();
+        generation.store(gen, Ordering::Release);
         *self.pending_replacement.lock().unwrap() = Some(Box::new(move || {
-            let audio = resolve_track(&api, &track, buf);
+            let current = || generation.load(Ordering::Acquire) == gen && crate::resolver_login::session_revision() == revision;
+            let retry = std::cell::Cell::new(false);
+            let mut audio = resolve_track(&api, &track, buf.clone(), &current, &retry);
+            if audio.is_none() && retry.get() && current() && credential.is_some() {
+                // A busy source or interrupted connection gets another fresh set of one-use tickets.
+                for _ in 0..10 {
+                    if !current() { return; }
+                    thread::sleep(Duration::from_millis(200));
+                }
+                audio = resolve_track(&api, &track, buf, &current, &retry);
+            }
             let _ = tx.send(Msg::Replacement { gen, credential, audio });
         }));
         let _ = self.replacement_wakeup.try_send(());
@@ -2200,6 +2228,93 @@ mod tests {
         let dec = Decoder::new(Cursor::new(bytes)).expect("decode");
         let samples = dec.take(44100).count();
         assert!(samples > 1000);
+    }
+
+    #[test]
+    #[ignore = "requires a dedicated signed-in test profile and authorized catalog account"]
+    fn resolve_live_catalog_recordings() {
+        let profile = std::env::var_os("YM_TEST_PROFILE").expect("use an isolated test profile");
+        assert_eq!(crate::config::dir(), std::path::PathBuf::from(profile));
+        assert!(crate::resolver_login::credential().is_some());
+        let api = Api::new(&std::env::var("YM_TOKEN").expect("local catalog credential"));
+        for id in std::env::var("YM_TEST_TRACK_IDS").unwrap().split(',') {
+            let t = api.tracks(&[id.to_owned()]).unwrap().pop().unwrap();
+            let (buf, _, _) = load_track(&api, &t).unwrap();
+            let retry = std::cell::Cell::new(false);
+            let audio = resolve_track(&api, &t, buf.clone(), &|| true, &retry).or_else(|| {
+                if !retry.get() { return None; }
+                thread::sleep(Duration::from_secs(2));
+                resolve_track(&api, &t, buf, &|| true, &retry)
+            });
+            let (_, _, format) = audio.unwrap_or_else(|| panic!("no verified replacement for {id}"));
+            eprintln!("verified catalog {id}: {format}");
+        }
+    }
+
+    #[test]
+    fn wave_promotes_only_the_matching_check_and_consumes_ready_audio_once() {
+        let track = |id| crate::api::parse_track(&serde_json::json!({"id":id,"title":"Track"})).unwrap();
+        let make_audio = |format: &str| {
+            // Three silent MPEG-1 Layer III frames, 128 kbps, 44.1 kHz.
+            let mut frame = vec![0; 417];
+            frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0]);
+            let bytes = frame.repeat(3);
+            let response = tungstenite::http::Response::builder()
+                .header("content-length", bytes.len()).body(bytes).unwrap();
+            let buf = Buf::from_media(response.into()).unwrap();
+            let decoder = open_decoder(&buf).unwrap();
+            (buf, decoder, format.to_owned())
+        };
+        let mut e = Engine::new(mpsc::channel().0, Default::default(), Default::default(), Arc::new(|| {}), Default::default());
+        // Drive completions ourselves, without network requests or an audio device.
+        let (wakeup, _rx) = mpsc::sync_channel(1);
+        e.replacement_wakeup = wakeup;
+        e.api = Some(Api::new(""));
+        e.current = Some(track(1));
+        e.loaded = true;
+        e.paused = false;
+        e.current_buf = Some(make_audio("current").0);
+        e.queue.push_back(track(2));
+        e.prefetch = Some(("2".into(), make_audio("baseline")));
+        e.check_replacement();
+        assert!(e.next_check.is_none());
+        let active = Arc::downgrade(&e.current_check.as_ref().unwrap().owner);
+        e.handle(Msg::Replacement { job: active, audio: None });
+        e.check_replacement();
+        let discarded = Arc::downgrade(&e.next_check.as_ref().unwrap().owner);
+        e.queue.push_front(track(3));
+        e.prefetch = Some(("3".into(), make_audio("baseline")));
+        e.check_replacement();
+        e.handle(Msg::Replacement { job: discarded, audio: Some(make_audio("stale")) });
+        assert!(!e.next_check.as_ref().unwrap().finished);
+        let prepared = Arc::downgrade(&e.next_check.as_ref().unwrap().owner);
+        e.handle(Msg::Replacement { job: prepared, audio: Some(make_audio("verified")) });
+        assert!(e.take_current_replacement().is_none());
+        e.prefetch = None;
+        e.api = None;
+        e.play_from_queue();
+        assert_eq!(e.current.as_ref().unwrap().id, "3");
+        assert_eq!(e.take_current_replacement().unwrap().2, "verified");
+        assert!(e.take_current_replacement().is_none());
+    }
+
+    #[test]
+    fn in_flight_wave_check_survives_promotion_but_not_account_reset() {
+        let mut e = Engine::new(mpsc::channel().0, Default::default(), Default::default(), Arc::new(|| {}), Default::default());
+        let next = crate::api::parse_track(&serde_json::json!({"id":17,"title":"Next"})).unwrap();
+        let owner = Arc::new(());
+        let job = Arc::downgrade(&owner);
+        e.next_check = Some(ReplacementCheck {
+            id: next.id.clone(), revision: crate::resolver_login::session_revision(), owner, finished: false, audio: None,
+        });
+        e.queue.push_back(next);
+        e.play_from_queue();
+        e.handle(Msg::Replacement { job: job.clone(), audio: None });
+        assert!(e.current_check.as_ref().unwrap().finished);
+        e.reset();
+        assert_eq!(job.strong_count(), 0);
+        e.handle(Msg::Replacement { job, audio: None });
+        assert!(e.current_check.is_none());
     }
 
     #[test]

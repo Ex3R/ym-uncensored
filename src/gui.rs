@@ -1338,9 +1338,8 @@ fn after_dpi_change() {
 
 const DONATE_URL: &str = "https://pay.cloudtips.ru/p/567e5376";
 
-/// Чат поддержки, как `createSupportChatUrl` оригинала.
-const SUPPORT_CHAT: &str =
-    "https://yandex.ru/chat?context=%7B%22entrypoint%22%3A%22web_desktop%22%7D#/user/ee219503-b69b-9484-405b-6877a510e13c";
+/// Обратная связь по форку, отдельно от поддержки сервиса Яндекса.
+const SUPPORT_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/issues");
 
 fn quit() {
     #[cfg(windows)]
@@ -1714,7 +1713,12 @@ fn set_icons(ui: &AppWindow, sprite: &Sprite) {
 }
 
 pub fn run(start_hidden: bool) -> Result<(), slint::PlatformError> {
-    let cfg = Config::load();
+    let mut cfg = Config::load();
+    let sources_connected = crate::resolver_login::credential().is_some();
+    if sources_connected && cfg.sources_setup.is_none() {
+        cfg.sources_setup = Some(true);
+        cfg.save();
+    }
     crate::api::set_lang(&cfg.lang);
     crate::i18n::set_lang(&cfg.lang);
     let dark = match cfg.theme.as_str() {
@@ -1757,6 +1761,8 @@ pub fn run(start_hidden: bool) -> Result<(), slint::PlatformError> {
     app.set_version(version.into());
     app.set_version_upstream(upstream.unwrap_or_default().into());
     app.set_app_name(env!("APP_NAME").into());
+    app.set_sources_requested(cfg.sources_setup == Some(true));
+    app.set_sources_setup_open(!sources_connected && cfg.sources_setup != Some(false));
     app.set_theme_mode(cfg.theme.clone().into());
     app.set_lang(cfg.lang.clone().into());
     ui.global::<T>().set_lang(cfg.lang.clone().into());
@@ -2482,7 +2488,7 @@ fn install_tray(ui: &AppWindow, player: &Player) {
                 Event::Updates => sys::open_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/releases")),
                 Event::Terms => sys::open_url("https://yandex.ru/legal/music_mobile_agreement/"),
                 Event::Recommendations => sys::open_url("https://music.yandex.ru/legal/recommendations/ru/#music"),
-                Event::Support => sys::open_url(SUPPORT_CHAT),
+                Event::Support => sys::open_url(SUPPORT_URL),
                 Event::Quit => quit(),
             }
         },
@@ -2717,6 +2723,18 @@ impl Ctx {
         app.set_logged_out(false);
         app.set_login_code(SharedString::new());
         self.player.send(Cmd::Login(t.access));
+        if self.st.borrow().cfg.sources_setup == Some(true) && crate::resolver_login::credential().is_none() {
+            self.connect_sources();
+        }
+    }
+
+    fn connect_sources(self: &Rc<Self>) {
+        crate::resolver_login::connect(|result| {
+            let _ = slint::invoke_from_event_loop(move || with_ctx(|c| {
+                c.ui().global::<App>().set_sources_connected(result.is_ok());
+                c.toast(result.err().unwrap_or_else(|| "Внешние источники подключены".into()));
+            }));
+        });
     }
 
     /// Токен живёт около года: за месяц до конца продлеваем его в фоне.
@@ -3153,7 +3171,7 @@ impl Ctx {
         match id {
             "account" => sys::open_url("https://id.yandex.ru"),
             "settings" => self.navigate(Page::Settings, None, true),
-            "support" => sys::open_url(SUPPORT_CHAT),
+            "support" => sys::open_url(SUPPORT_URL),
             _ => {}
         }
     }
@@ -3237,7 +3255,8 @@ impl Ctx {
                 app.set_hidden_blocks(SharedString::new());
                 self.toast("Скрытые блоки снова на главной");
             }
-            "about" => sys::open_url(env!("CARGO_PKG_REPOSITORY")),
+            "about" => sys::open_url(env!("CARGO_PKG_HOMEPAGE")),
+            "components" => sys::open_url(concat!(env!("CARGO_PKG_REPOSITORY"), "#source-and-licenses")),
             "donate" => sys::open_url(DONATE_URL),
             "discord" => {
                 let on = !app.get_discord_on();
@@ -3257,15 +3276,14 @@ impl Ctx {
             }
             "external-sources" => {
                 if crate::resolver_login::credential().is_some() {
+                    { let mut st = self.st.borrow_mut(); st.cfg.sources_setup = Some(false); st.cfg.save(); }
+                    app.set_sources_requested(false);
                     crate::resolver_login::disconnect();
                     app.set_sources_connected(false);
                 } else {
-                    crate::resolver_login::connect(|result| {
-                        let _ = slint::invoke_from_event_loop(move || with_ctx(|c| {
-                            c.ui().global::<App>().set_sources_connected(result.is_ok());
-                            c.toast(result.err().unwrap_or_else(|| "Внешние источники подключены".into()));
-                        }));
-                    });
+                    { let mut st = self.st.borrow_mut(); st.cfg.sources_setup = Some(true); st.cfg.save(); }
+                    app.set_sources_requested(true);
+                    self.connect_sources();
                 }
             }
             "check-updates" => {
@@ -4395,6 +4413,18 @@ fn register_extra(app: &App) {
         })
     });
     app.on_menu_action(|id| with_ctx(|c| c.menu_action(&id)));
+    app.on_sources_choose(|enabled| with_ctx(|c| {
+        {
+            let mut st = c.st.borrow_mut();
+            st.cfg.sources_setup = Some(enabled);
+            st.cfg.save();
+        }
+        let ui = c.ui();
+        let app = ui.global::<App>();
+        app.set_sources_requested(enabled);
+        app.set_sources_setup_open(false);
+        if enabled && c.st.borrow().cfg.token.is_some() { c.connect_sources(); }
+    }));
     app.on_login_start(|| with_ctx(|c| c.login_start()));
     app.on_list_open_artist(|i| {
         with_ctx(|c| {
