@@ -138,7 +138,7 @@ pub fn check() -> Result<Option<Release>, String> {
     #[cfg(windows)]
     let exe = assets.and_then(|assets| find_asset(assets, |n| n == ASSET));
     #[cfg(target_os = "macos")]
-    let dmg = assets.and_then(|assets| find_asset(assets, |n| n.starts_with("yamusic-rs-") && n.ends_with("-macos.dmg")));
+    let dmg = assets.and_then(|assets| find_asset(assets, |n| n.starts_with("ym-uncensored-") && n.ends_with("-macos.dmg")));
     Ok(Some(Release {
         version: tag.trim_start_matches('v').to_string(),
         page: release_page(&v, cfg!(target_os = "android")),
@@ -276,7 +276,7 @@ mod tests {
         let mut release = serde_json::json!({
             "html_url": page,
             "assets": [
-                {"name": "yamusic-rs-1.1.5-macos.dmg", "browser_download_url": "https://example.com/test.dmg"},
+                {"name": "ym-uncensored-1.1.5-macos.dmg", "browser_download_url": "https://example.com/test.dmg"},
                 {"name": "yamusic-rs-arm64-v8a.apk", "browser_download_url": apk},
             ]
         });

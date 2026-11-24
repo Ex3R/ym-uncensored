@@ -268,7 +268,7 @@ mod tests {
         let tag = v.get("tag_name")?.as_str()?.trim_start_matches('v').to_string();
         let dmg = v.get("assets")?.as_array()?.iter().find_map(|a| {
             let name = a.get("name")?.as_str()?;
-            if !(name.starts_with("yamusic-rs-") && name.ends_with("-macos.dmg")) {
+            if !(name.starts_with("ym-uncensored-") && name.ends_with("-macos.dmg")) {
                 return None;
             }
             Some((
