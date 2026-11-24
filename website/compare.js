@@ -8,6 +8,18 @@
   const message = card.querySelector("#ab-status");
   const length = 60;
   const repeat = card.querySelector("#repeat-phrase");
+  const cuts = [...card.querySelectorAll("[data-from]")].map(button => ({
+    start: Number(button.dataset.from), end: Number(button.dataset.until), button
+  }));
+  const cutNow = card.querySelector(".cut-now");
+  const tip = card.querySelector(".listen-tip");
+  let tipDismissed = false;
+  try { tipDismissed = sessionStorage.getItem("ym-tip-hidden") === "1"; } catch (_) {}
+  tip.querySelector("button").addEventListener("click", () => {
+    tip.hidden = true; tipDismissed = true;
+    try { sessionStorage.setItem("ym-tip-hidden","1"); } catch (_) {}
+  });
+  let currentCut;
   let loopRange = null;
   let context, buffers, loading, gains, pair, startTime, startOffset = 0;
   let position = 0, generation = 0, frame = 0, levels, pending = false;
@@ -27,6 +39,12 @@
     timeline.value = sec;
     timeline.setAttribute("aria-valuetext", time(sec));
     clock.value = time(sec) + " / 1:00";
+    const inside = cuts.find(c => sec >= c.start && sec < c.end);
+    if (inside !== currentCut) {
+      currentCut = inside;
+      cutNow.hidden = !inside;
+      for (const cut of cuts) cut.button.classList.toggle("current", cut === inside);
+    }
     const w = wave.clientWidth, h = wave.clientHeight;
     const dpr = window.devicePixelRatio || 1;
     if (wave.width !== Math.round(w*dpr) || wave.height !== Math.round(h*dpr)) {
@@ -34,6 +52,15 @@
     }
     const g = wave.getContext("2d");
     g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,w,h);
+    for (const cut of cuts) {
+      const x = w*cut.start/length;
+      const width = Math.max(2,w*(cut.end-cut.start)/length);
+      g.fillStyle = cut === inside ? "#8d5823" : "#694e36";
+      g.fillRect(x,0,width,h);
+      g.fillStyle = "#ffbb69";
+      g.fillRect(x,0,width,3);
+      g.fillRect(x,h-3,width,3);
+    }
     if (levels) {
       const count = Math.max(1,Math.floor(w/3.3));
       const blend = Number(mix.value)/100;
@@ -41,7 +68,9 @@
         const col = Math.min(levels[0].length-1, Math.floor(i/count*levels[0].length));
         const amp = levels[0][col]*(1-blend)+levels[1][col]*blend;
         const bar = Math.max(2,amp*(h-5));
-        g.fillStyle = i/count < sec/length ? "#f6d6ea" : "#aa99ad";
+        const t=(i+.5)*length/count;
+        const censored=cuts.some(c => t>=c.start && t<c.end);
+        g.fillStyle = censored ? "#ffca85" : i/count < sec/length ? "#f6d6ea" : "#aa99ad";
         g.fillRect(i*w/count, (h-bar)/2, 2, bar);
       }
     }
@@ -154,18 +183,26 @@
   timeline.addEventListener("input",()=>seek(Number(timeline.value)));
   mix.addEventListener("input",balance);
   card.querySelectorAll("[data-mix]").forEach(button=>button.addEventListener("click",()=>{
+    const switchedWhilePlaying = Boolean(pair) && Number(mix.value) !== Number(button.dataset.mix);
     mix.value=button.dataset.mix;
+    if (switchedWhilePlaying && !tipDismissed) tip.hidden=false;
     balance();
     if (!pair && !pending) begin();
   }));
+  for (const cut of cuts) cut.button.addEventListener("click", () => {
+    const start = Math.max(0,cut.start-.35);
+    if (loopRange) loopRange={start,end:Math.min(length,cut.end+.45)};
+    seek(start,true);
+  });
   repeat.addEventListener("click",()=>{
     const wasPlaying=Boolean(pair)||pending;
     stop();
     if (loopRange) {
       loopRange=null;
     } else {
-      const start=Math.max(0,Math.min(length-4.5,position-1));
-      loopRange={start,end:start+4.5};
+      const cut=cuts.find(c => position>=c.start-.45 && position<c.end+.15);
+      const start=cut ? Math.max(0,cut.start-.35) : Math.max(0,Math.min(length-4.5,position-1));
+      loopRange={start,end:cut ? Math.min(length,cut.end+.45) : start+4.5};
       position=start;
     }
     repeat.setAttribute("aria-pressed",String(Boolean(loopRange)));

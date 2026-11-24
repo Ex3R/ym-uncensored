@@ -142,3 +142,17 @@ footer { padding-top: 24px; }
 .blend { text-align:right; }
 .blend label { display:block; font-size:11px; color:#cdbfd2; }
 .blend input { display:block; width:135px; }
+.cuts { margin:9px 0 5px; padding:10px 0; border-top:1px solid #514855; border-bottom:1px solid #514855; display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+.cuts-head, .cut-times { display:flex; align-items:center; gap:6px; }
+.cuts-head { font-size:13px; color:#ffcea0; }
+.cut-key { width:12px; height:12px; border:1px solid #ffbf77; background:repeating-linear-gradient(120deg,#f4b46f 0 2px,#5a4435 2px 4px); }
+.cut-now { color:#fff; font-size:11px; }
+.cut-times button { cursor:pointer; font:12px ui-monospace,monospace; color:#ffdaaf; border:1px solid #795f4b; border-radius:4px; background:none; min-height:31px; padding:4px 6px; }
+.cut-times button:hover, .cut-times button.current { background:#ffc27e; color:#332516; }
+.listen-tip:not([hidden]) { display:flex; align-items:center; gap:8px; padding:9px 12px; margin-top:10px; border-radius:5px; background:#f2ddec; color:#312630; font-size:13px; }
+.listen-tip a { font-weight:650; margin-left:auto; }
+.listen-tip button { background:none; color:#493747; border:0; padding:0 4px; font-size:19px; }
+dialog .donate { display:block; width:100%; text-align:center; padding:13px; background:#332733; }
+dialog .skip { margin-top:5px; }
+dialog .retry { margin-top:8px; }
+@media(max-width:430px){.cuts{gap:3px}.cuts-head{font-size:12px}.cut-times{gap:4px}.cut-times button{min-height:34px}.listen-tip:not([hidden]){flex-wrap:wrap}}

@@ -5,7 +5,7 @@
 <meta name="theme-color" content="#fafaf8">
 <meta name="description" content="YM UNCENSORED — неофициальный плеер Яндекс Музыки с автоматическим подбором версий без цензуры. Для macOS, Windows, Linux и Android.">
 <title>YM UNCENSORED</title>
-<link rel="icon" href="assets/icon.svg"><link rel="stylesheet" href="style.css?layout=ab2"><script src="download.js" defer></script><script src="compare.js?cut=89" defer></script>
+<link rel="icon" href="assets/icon.svg"><link rel="stylesheet" href="style.css?layout=cuts"><script src="download.js?release=020-support" defer></script><script src="compare.js?cut=89-marked" defer></script>
 </head>
 <body>
 <div class="page">
@@ -23,8 +23,16 @@
 <div class="transport"><button class="listen" type="button" aria-label="Воспроизвести" aria-pressed="false"><span aria-hidden="true">▶</span></button>
 <div class="wave-wrap"><canvas id="wave" aria-hidden="true"></canvas><input type="range" id="timeline" aria-label="Позиция во фрагменте" min="0" max="60" step="0.1" value="0"></div>
 <output id="clock" for="timeline">0:00 / 1:00</output></div>
+<div class="cuts"><div class="cuts-head"><span class="cut-key" aria-hidden="true"></span><span>Вырезанный вокал</span><span class="cut-now" hidden>Сейчас</span></div>
+<div class="cut-times" role="group" aria-label="Перейти к вырезанной фразе">
+<button type="button" data-from="1.49" data-until="3.25" aria-label="Прослушать первый вырезанный фрагмент, около 2 секунд">0:02</button>
+<button type="button" data-from="7.43" data-until="10.22" aria-label="Прослушать второй вырезанный фрагмент, около 8 секунд">0:08</button>
+<button type="button" data-from="10.67" data-until="11.37" aria-label="Прослушать третий вырезанный фрагмент, около 11 секунд">0:11</button>
+<button type="button" data-from="40.33" data-until="41.89" aria-label="Прослушать четвёртый вырезанный фрагмент, около 41 секунды">0:41</button>
+</div></div>
 <div class="compare-options"><button id="repeat-phrase" type="button" aria-pressed="false">↻ Повторить фразу</button>
 <details class="blend"><summary>Баланс версий</summary><label for="mix">С цензурой ↔ Без цензуры</label><input id="mix" type="range" min="0" max="100" step="1" value="0" aria-label="Баланс между версиями"></details></div>
+<div class="listen-tip" hidden><span>Слышишь разницу?</span><a href="https://pay.cloudtips.ru/p/567e5376" target="_blank" rel="noopener noreferrer">Поддержать Ex3R ↗</a><button type="button" aria-label="Скрыть просьбу о поддержке">×</button></div>
 <p class="ab-status" role="status" id="ab-status"></p>
 </section></div>
 <section id="download" aria-labelledby="downloads-title">
@@ -45,7 +53,7 @@
 </div>
 <dialog aria-labelledby="tip-title">
 <form method="dialog"><button class="cross" aria-label="Закрыть">×</button></form>
-<p id="download-status" class="status">Загрузка</p><h2 id="tip-title">Поддержать разработку?</h2><p class="note">Если плеер тебе пригодился, можно оставить донат любой суммы.</p>
+<p id="download-status" class="status">Загрузка</p><h2 id="tip-title">Поддержи разработку плеера</h2><p class="note">YM Uncensored делает Ex3R. Помоги следующему обновлению выйти — выбери любую сумму в CloudTips.</p>
 <a class="donate" href="https://pay.cloudtips.ru/p/567e5376" target="_blank" rel="noopener noreferrer">Поддержать Ex3R ↗</a>
 <button type="button" class="skip">В другой раз</button><a class="retry" id="retry" href="#download">Скачать ещё раз</a>
 </dialog>
