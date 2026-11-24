@@ -6,7 +6,7 @@ document.querySelectorAll(".file").forEach(link => {
     if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
     if (typeof dialog.showModal !== "function") return;
     retry.href = link.href;
-    statusLabel.textContent = "ЗАГРУЗКА / " + link.dataset.os;
+    statusLabel.textContent = "Скачивание для " + link.dataset.os;
     dialog.showModal();
     // The link's native action downloads the attachment, even when the donation is skipped.
   });
