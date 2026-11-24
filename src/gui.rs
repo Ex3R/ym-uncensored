@@ -1337,7 +1337,7 @@ fn after_dpi_change() {
     }
 }
 
-const DONATE_URL: &str = "https://pay.cloudtips.ru/p/befb620d";
+const DONATE_URL: &str = "https://pay.cloudtips.ru/p/567e5376";
 
 /// Чат поддержки, как `createSupportChatUrl` оригинала.
 const SUPPORT_CHAT: &str =
