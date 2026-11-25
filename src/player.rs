@@ -13,7 +13,7 @@ use crate::stream::{Buf, Reader};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source as _};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -176,6 +176,75 @@ type Notify = Arc<dyn Fn() + Send + Sync>;
 type LikeCompleted = Box<dyn FnOnce(&Track, bool, &Res<()>) + Send>;
 type Job = Box<dyn FnOnce() + Send>;
 pub type Likes = Arc<Mutex<HashSet<String>>>;
+
+#[derive(Default)]
+struct VerificationGate {
+    state: Mutex<VerificationGateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct VerificationGateState {
+    foreground_pending: usize,
+    verifying: bool,
+}
+
+struct ForegroundReservation(Arc<VerificationGate>);
+
+impl Drop for ForegroundReservation {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.foreground_pending = state.foreground_pending.saturating_sub(1);
+        self.0.changed.notify_all();
+    }
+}
+
+struct VerificationPermit(Arc<VerificationGate>);
+
+impl Drop for VerificationPermit {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().verifying = false;
+        self.0.changed.notify_all();
+    }
+}
+
+impl VerificationGate {
+    fn reserve_foreground(self: &Arc<Self>) -> ForegroundReservation {
+        self.state.lock().unwrap().foreground_pending += 1;
+        self.changed.notify_all();
+        ForegroundReservation(self.clone())
+    }
+
+    fn enter(self: &Arc<Self>, foreground: bool, current: &dyn Fn() -> bool) -> Option<VerificationPermit> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if !current() { return None; }
+            if !state.verifying && (foreground || state.foreground_pending == 0) {
+                state.verifying = true;
+                return Some(VerificationPermit(self.clone()));
+            }
+            let (next, _) = self.changed.wait_timeout(state, Duration::from_millis(100)).unwrap();
+            state = next;
+        }
+    }
+}
+
+#[derive(Clone)]
+struct VerificationContext {
+    gate: Arc<VerificationGate>,
+    foreground: bool,
+}
+
+fn speculative_download_slot<'a>(lock: &'a Mutex<()>, active: &dyn Fn() -> bool) -> Option<MutexGuard<'a, ()>> {
+    loop {
+        if !active() { return None; }
+        match lock.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(50)),
+            Err(TryLockError::Poisoned(error)) => return Some(error.into_inner()),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Player {
@@ -534,6 +603,7 @@ fn load_for_playback(
 
 fn resolve_track(
     api: &Api, t: &Track, buf: Arc<Buf>, current: &(impl Fn() -> bool + Clone + Send + 'static), retry: &std::cell::Cell<bool>,
+    verification: Option<&VerificationContext>,
 ) -> Option<Audio> {
     use crate::{originals, verification::Recording};
     let revision = crate::resolver_login::session_revision();
@@ -559,6 +629,10 @@ fn resolve_track(
         let baseline = std::cell::OnceCell::new();
         let check = |candidate: Audio| -> Option<Audio> {
             if !current() { return None; }
+            let _permit = match verification {
+                Some(context) => Some(context.gate.enter(context.foreground, current)?),
+                None => None,
+            };
             let reference = baseline.get_or_init(|| Recording::decode(open_decoder(&buf).ok()?, t.duration_ms)).as_ref().or_else(|| { log("Замена: исходное аудио не декодировано"); None })?;
             let alternative = Recording::decode(open_decoder(&candidate.0).ok()?, t.duration_ms)
                 .or_else(|| { log("Замена: не удалось прочитать альтернативную запись"); None })?;
@@ -591,9 +665,20 @@ fn resolve_track(
         let original_hash = if buf.done() { originals::complete_digest(&buf, current) } else { None };
         let cache_hash = original_hash.clone();
         let requested = t.clone();
+        let fetch_limit = verification.filter(|context| !context.foreground).map(|_| Arc::new(Mutex::new(())));
         return candidate_downloads::first_verified(
-            candidates, next, current.clone(), originals::online_next,
-            move |candidate, active| originals::online_audio(candidate, &requested, cache_hash.as_deref(), &active),
+            candidates, next, current.clone(),
+            |ticket| {
+                let items = originals::online_next(ticket)?;
+                let next = items.first().and_then(|item| item.next.clone());
+                Ok((items, next))
+            },
+            move |candidate, active| {
+                let _slot = if let Some(limit) = &fetch_limit {
+                    Some(speculative_download_slot(limit, &active).ok_or_else(|| "cancelled".to_owned())?)
+                } else { None };
+                originals::online_audio(candidate, &requested, cache_hash.as_deref(), &active)
+            },
             |incoming| {
                 let (candidate, result) = incoming.inspect_err(|_| {
                     retry.set(true);
@@ -740,6 +825,7 @@ struct Engine {
     current: Option<Track>,
     pending_replacement: Arc<Mutex<Option<Job>>>,
     replacement_wakeup: mpsc::SyncSender<()>,
+    verification_gate: Arc<VerificationGate>,
     current_check: Option<ReplacementCheck>,
     current_lookup_revision: Option<u64>,
     next_check: Option<ReplacementCheck>,
@@ -811,6 +897,7 @@ impl Engine {
             .expect("bg thread");
         // Keep only the most recent pending track while a comparison is in progress.
         let pending_replacement = Arc::new(Mutex::new(None::<Job>));
+        let verification_gate = Arc::new(VerificationGate::default());
         let pending = pending_replacement.clone();
         let (replacement_wakeup, wakeup) = mpsc::sync_channel::<()>(1);
         thread::spawn(move || {
@@ -846,6 +933,7 @@ impl Engine {
             catalog_buf: None,
             pending_replacement,
             replacement_wakeup,
+            verification_gate,
             current_check: None,
             current_lookup_revision: None,
             next_check: None,
@@ -1620,6 +1708,8 @@ impl Engine {
             }
             Cmd::Resume => self.resume(),
             Cmd::Leave(done) => {
+                // A speculative next-track resolver must not outlive application shutdown.
+                self.next_check = None;
                 if let (Some(api), Some(now)) = (self.api.clone(), self.ynison_now()) {
                     if let Err(e) = crate::ynison::publish(api.token(), &crate::ynison::device_id(), &now) {
                         log(format!("ynison: {e}"));
@@ -2329,13 +2419,12 @@ impl Engine {
     fn check_replacement(&mut self) {
         if !self.loaded || !replacements_enabled() { return; }
         let revision = crate::resolver_login::session_revision();
-        let Some(track) = self.current.as_ref() else { return };
+        let Some(track) = self.current.clone() else { return };
         // An account can connect after the first catalog buffer was already queued.
         // Run this cheap lookup independently of an old account's in-flight ASR.
         if self.current_lookup_revision != Some(revision) {
             self.current_lookup_revision = Some(revision);
             if let (Some(api), Some((baseline, _))) = (self.api.clone(), self.catalog_buf.clone()) {
-                let track = track.clone();
                 let owner = self.current_load.insert(Arc::new(())).clone();
                 let job = Arc::downgrade(&owner);
                 self.next_check = None;
@@ -2349,11 +2438,11 @@ impl Engine {
                 return;
             }
         }
-        if !self.current_check.as_ref().is_some_and(|c| c.matches(track, revision)) {
+        if !self.current_check.as_ref().is_some_and(|c| c.matches(&track, revision)) {
             if self.paused { return; }
             let Some((buf, _)) = self.catalog_buf.clone() else { return };
             self.next_check = None;
-            self.current_check = self.schedule_check(track.clone(), buf, revision);
+            self.current_check = self.schedule_check(track.clone(), buf, revision, true, false);
             return;
         }
         if self.fading.is_none() {
@@ -2390,42 +2479,62 @@ impl Engine {
             self.next_check.take_if(|c| !c.finished);
             return;
         }
-        if self.next_check.is_some() || !self.current_check.as_ref().is_some_and(|c| c.finished) { return; }
-        let (Some(next), Some((id, baseline))) = (next, &self.prefetch) else { return };
-        if next.id == *id && baseline.known.revision() != Some(revision) {
-            self.next_check = self.schedule_check(next.clone(), baseline.baseline.0.clone(), revision);
-        }
+        if self.next_check.is_some() { return; }
+        let Some((next, baseline)) = self.next_prefetch_target(revision) else { return };
+        // Queue the playing track first. Once that job has been submitted, one independent
+        // resolver can use the remaining playback time to verify the already-prefetched next.
+        // This lets the server work before a skip without ever creating more than one next job.
+        let current_in_flight = self.current_check.as_ref().is_some_and(|c| c.matches(&track, revision) && !c.finished);
+        self.next_check = self.schedule_check(next, baseline, revision, false, current_in_flight);
     }
 
-    fn schedule_check(&self, track: Track, buf: Arc<Buf>, revision: u64) -> Option<ReplacementCheck> {
+    fn next_prefetch_target(&self, revision: u64) -> Option<(Track, Arc<Buf>)> {
+        let next = self.queue.front()?;
+        let (id, loaded) = self.prefetch.as_ref()?;
+        if next.id != *id || loaded.known.revision() == Some(revision) || !crate::originals::can_match(next) {
+            return None;
+        }
+        Some((next.clone(), loaded.baseline.0.clone()))
+    }
+
+    fn schedule_check(&self, track: Track, buf: Arc<Buf>, revision: u64, foreground: bool, run_concurrently: bool) -> Option<ReplacementCheck> {
         let api = self.api.clone()?;
         let check = ReplacementCheck {
             id: track.id.clone(), revision, owner: Arc::new(()), finished: false, audio: None,
         };
         let job = Arc::downgrade(&check.owner);
         let tx = self.tx.clone();
-        *self.pending_replacement.lock().unwrap() = Some(Box::new(move || {
+        let gate = self.verification_gate.clone();
+        let reservation = foreground.then(|| gate.reserve_foreground());
+        let verification = VerificationContext { gate, foreground };
+        let task: Job = Box::new(move || {
+            let _reservation = reservation;
             let load = job.clone();
             let current = move || load.strong_count() > 0 && replacements_enabled()
                 && crate::resolver_login::session_revision() == revision;
             if !current() { return; }
             let credential = crate::resolver_login::credential();
             let retry = std::cell::Cell::new(false);
-            let mut audio = resolve_track(&api, &track, buf.clone(), &current, &retry);
+            let mut audio = resolve_track(&api, &track, buf.clone(), &current, &retry, Some(&verification));
             if audio.is_none() && retry.get() && current() && credential.is_some() {
                 // A busy source or interrupted connection gets another fresh set of one-use tickets.
                 for _ in 0..10 {
                     if !current() { return; }
                     thread::sleep(Duration::from_millis(200));
                 }
-                audio = resolve_track(&api, &track, buf, &current, &retry);
+                audio = resolve_track(&api, &track, buf, &current, &retry, Some(&verification));
             }
             if current() {
                 let audio = audio.filter(|_| credential == crate::resolver_login::credential());
                 let _ = tx.send(Msg::Replacement { job, audio });
             }
-        }));
-        let _ = self.replacement_wakeup.try_send(());
+        });
+        if run_concurrently {
+            thread::spawn(task);
+        } else {
+            *self.pending_replacement.lock().unwrap() = Some(task);
+            let _ = self.replacement_wakeup.try_send(());
+        }
         Some(check)
     }
 
@@ -2650,16 +2759,16 @@ mod tests {
             let (buf, baseline, _) = load_audio(&api, &t.id).unwrap();
             let retry = std::cell::Cell::new(false);
             if std::env::var_os("YM_TEST_OFFLINE_SOURCES").is_some() {
-                assert!(resolve_track(&api,&t,buf.clone(),&|| true,&retry).is_none());
+                assert!(resolve_track(&api,&t,buf.clone(),&|| true,&retry,None).is_none());
                 assert!(retry.get());
                 assert!(baseline.take(44100).any(|sample| sample.unsigned_abs() > 32));
                 eprintln!("original {id} decoded after source connection failed");
                 continue;
             }
-            let audio = resolve_track(&api, &t, buf.clone(), &|| true, &retry).or_else(|| {
+            let audio = resolve_track(&api, &t, buf.clone(), &|| true, &retry, None).or_else(|| {
                 if !retry.get() { return None; }
                 thread::sleep(Duration::from_secs(2));
-                resolve_track(&api, &t, buf, &|| true, &retry)
+                resolve_track(&api, &t, buf, &|| true, &retry, None)
             });
             let (_, _, format) = audio.unwrap_or_else(|| panic!("no verified replacement for {id}"));
             eprintln!("verified catalog {id}: {format}");
@@ -2896,6 +3005,101 @@ mod tests {
         assert_eq!(e.current.as_ref().unwrap().id, "3");
         assert_eq!(e.take_current_replacement().unwrap().2, "verified");
         assert!(e.take_current_replacement().is_none());
+    }
+
+    #[test]
+    fn prefetched_next_is_checked_while_current_check_runs_and_promoted_once() {
+        let _guard = super::EXPLICIT_TEST_LOCK.lock().unwrap();
+        let track = |id| crate::api::parse_track(&serde_json::json!({
+            "id":id,"title":"English test","durationMs":120000,
+            "artists":[{"id":1,"name":"Test Artist"}]
+        })).unwrap();
+        let current=track("148716093");
+        let next=track("148716915");
+        let revision=crate::resolver_login::session_revision();
+        let (tx,rx)=mpsc::channel();
+        let mut e=Engine::new(tx,Default::default(),Default::default(),Arc::new(|| {}),Default::default());
+        let (wakeup, wakeups)=mpsc::sync_channel(1);
+        e.replacement_wakeup=wakeup;
+        e.api=Some(Api::new(""));
+        e.current=Some(current.clone());
+        e.current_lookup_revision=Some(revision);
+        e.current_check=Some(ReplacementCheck { id:current.id, revision, owner:Arc::new(()), finished:false, audio:None });
+        e.loaded=true;
+        e.queue.push_back(next.clone());
+        e.prefetch=Some((next.id.clone(),LoadedTrack { baseline:make_audio("prefetch baseline"), known:KnownStatus::Miss(revision) }));
+
+        // A known lookup still in flight must finish before full discovery, avoiding duplicate /known work.
+        e.prefetch.as_mut().unwrap().1.known=KnownStatus::Pending(revision);
+        assert!(e.next_prefetch_target(revision).is_none());
+        e.prefetch.as_mut().unwrap().1.known=KnownStatus::Miss(revision);
+        e.check_replacement();
+        assert!(e.current_check.as_ref().is_some_and(|check| !check.finished),"current track keeps priority");
+        let next_job=Arc::downgrade(&e.next_check.as_ref().expect("next resolver starts before current finishes").owner);
+        assert_eq!(e.next_check.as_ref().unwrap().id,next.id);
+        assert!(e.pending_replacement.lock().unwrap().is_none(),"next work must not replace or occupy the current-priority job");
+        assert!(wakeups.try_recv().is_err());
+
+        let completed=rx.recv_timeout(Duration::from_secs(4)).expect("offline fixture resolver should complete");
+        assert!(matches!(&completed,Msg::Replacement { audio:None, .. }));
+        e.handle(completed);
+        assert!(e.next_check.as_ref().unwrap().finished);
+
+        // Simulate a separately verified audio result. Queue promotion transfers the same
+        // owner/check to current; it does not issue a second resolver request.
+        e.handle(Msg::Replacement { job:next_job.clone(), audio:Some(make_audio("verified next")) });
+        e.prefetch=None;
+        e.prefetching=Some(next.id.clone());
+        e.prefetch_load=Some(Arc::new(()));
+        e.play_from_queue();
+        assert_eq!(e.current.as_ref().unwrap().id,next.id);
+        assert!(e.next_check.is_none());
+        assert!(e.current_check.as_ref().is_some_and(|check| check.matches(&next,revision)));
+        assert_eq!(e.take_current_replacement().unwrap().2,"verified next");
+        assert!(e.take_current_replacement().is_none(),"promoted audio is consumed once");
+    }
+
+    #[test]
+    fn speculative_verification_waits_for_foreground_and_observes_cancellation() {
+        let gate=Arc::new(VerificationGate::default());
+        let foreground=gate.reserve_foreground();
+        let current=Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let probe=current.clone();
+        let low_gate=gate.clone();
+        let (tx,rx)=mpsc::channel();
+        let low=thread::spawn(move || {
+            let active=|| probe.load(std::sync::atomic::Ordering::Acquire);
+            let permit=low_gate.enter(false,&active);
+            tx.send(permit.is_some()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(),"next ASR must wait while the current resolver owns priority");
+        current.store(false,std::sync::atomic::Ordering::Release);
+        assert!(!rx.recv_timeout(Duration::from_secs(1)).expect("cancelled low-priority waiter should wake promptly"));
+        low.join().unwrap();
+        drop(foreground);
+    }
+
+    #[test]
+    fn verification_gate_serializes_foreground_and_one_prefetch() {
+        let gate=Arc::new(VerificationGate::default());
+        let reservation=gate.reserve_foreground();
+        let foreground=gate.enter(true,&|| true).expect("foreground gets the reserved verifier");
+        let low_gate=gate.clone();
+        let (entered_tx,entered_rx)=mpsc::channel();
+        let (release_tx,release_rx)=mpsc::channel();
+        let low=thread::spawn(move || {
+            let permit=low_gate.enter(false,&|| true).unwrap();
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(permit);
+        });
+        assert!(entered_rx.recv_timeout(Duration::from_millis(150)).is_err(),"prefetch cannot run ASR beside current");
+        drop(foreground);
+        assert!(entered_rx.recv_timeout(Duration::from_millis(150)).is_err(),"reservation keeps priority until current resolver completes");
+        drop(reservation);
+        entered_rx.recv_timeout(Duration::from_secs(1)).expect("one prefetch may use the verifier after current completes");
+        release_tx.send(()).unwrap();
+        low.join().unwrap();
     }
 
     #[test]

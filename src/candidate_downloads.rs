@@ -9,7 +9,7 @@ pub(super) fn first_verified<C, M, A>(
     first: Vec<C>,
     continuation: Option<String>,
     current: impl Fn() -> bool + Clone + Send + 'static,
-    next: impl FnOnce(&str) -> Res<Vec<C>> + Send + 'static,
+    next: impl Fn(&str) -> Res<(Vec<C>, Option<String>)> + Send + 'static,
     fetch: impl Fn(&C, &dyn Fn() -> bool) -> Res<M> + Clone + Send + 'static,
     mut inspect: impl FnMut(Res<(C, M)>) -> Option<A>,
 ) -> Option<A>
@@ -45,18 +45,26 @@ where
             }
         });
     }
-    if let Some(ticket) = continuation {
+    if let Some(mut ticket) = continuation {
         thread::spawn(move || {
-            // Give a ready local copy a chance to win without asking for more sources.
-            thread::sleep(Duration::from_millis(300));
-            if !active() { return; }
-            match next(&ticket) {
-                Ok(items) => {
-                    for item in items {
-                        if !active() || enqueue.send(item).is_err() { break; }
+            // A ready local copy may finish before another source search is needed.
+            // The service has a finite set of stages. Cap pagination as a safeguard
+            // against a broken endpoint returning a fresh continuation indefinitely.
+            for _ in 0..4 {
+                thread::sleep(Duration::from_millis(300));
+                if !active() { return; }
+                match next(&ticket) {
+                    Ok((items, follow)) => {
+                        for item in items {
+                            if !active() || enqueue.send(item).is_err() { return; }
+                        }
+                        match follow {
+                            Some(page) if page != ticket => ticket = page,
+                            _ => return,
+                        }
                     }
+                    Err(error) => { let _ = send.send(Err(error)); return; }
                 }
-                Err(error) => { let _ = send.send(Err(error)); }
             }
         });
     } else {
@@ -89,7 +97,7 @@ mod tests {
             move |ticket| {
                 assert_eq!(ticket, "ticket");
                 first_started.recv_timeout(Duration::from_secs(2)).unwrap();
-                Ok(vec![2, 3])
+                Ok((vec![2, 3], None))
             },
             move |item, active| {
                 if *item == 1 {
@@ -105,6 +113,19 @@ mod tests {
             });
         assert_eq!(result, Some(3));
         first_ended.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn candidates_on_a_later_page_still_get_verified() {
+        let result = first_verified(vec![1], Some("regional".into()), || true,
+            |ticket| match ticket {
+                "regional" => Ok((vec![2], Some("remaining".into()))),
+                "remaining" => Ok((vec![3], None)),
+                _ => panic!("unexpected continuation"),
+            },
+            |item, _| Ok(*item),
+            |result| result.ok().map(|(_, media)| media).filter(|&media| media == 3));
+        assert_eq!(result, Some(3));
     }
 
     #[test]

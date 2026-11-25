@@ -236,7 +236,9 @@ pub fn public_metadata(track: &Track) -> Option<serde_json::Value> {
 
 fn post_metadata(path: &str, token: &str, body: &serde_json::Value, timeout: Duration) -> Res<reqwest::blocking::Response> {
     let body = serde_json::to_vec(body).map_err(|e| e.to_string())?;
-    resolver_login::signed("POST", path, token, body)?.timeout(timeout).send().map_err(|e| e.to_string())
+    let request = resolver_login::signed("POST", path, token, body)?;
+    let request = if path == "/search" { request.header("X-YM-Search-Pages", "1") } else { request };
+    request.timeout(timeout).send().map_err(|e| e.to_string())
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(response: reqwest::blocking::Response) -> Res<T> {
@@ -270,6 +272,8 @@ pub struct KnownCandidate {
     baseline_sha256: Option<String>,
     pair_sha256: Option<String>,
     #[serde(default)]
+    pair_sha256s: Vec<String>,
+    #[serde(default)]
     baseline_sha256s: Vec<String>,
 }
 
@@ -295,6 +299,9 @@ impl KnownCandidate {
     fn cache_key(&self, track: &str) -> Option<String> {
         let media = self.candidate.sha256.as_deref().filter(|s| digest_valid(s))?;
         if self.baseline_sha256s.len() > 16 || self.baseline_sha256s.iter().any(|s| !digest_valid(s) || s == media) { return None; }
+        if self.pair_sha256s.len() > 8 || self.pair_sha256s.iter().enumerate().any(|(i, pair)|
+            !digest_valid(pair) || pair == media || Some(pair) == self.pair_sha256.as_ref() || self.pair_sha256s[..i].contains(pair)
+        ) { return None; }
         match (&self.baseline_sha256, &self.pair_sha256) {
             (Some(baseline), None) if digest_valid(baseline) && baseline != media => Some(pair_digest(track, baseline, media)),
             (None, Some(pair)) if digest_valid(pair) && self.baseline_sha256s.is_empty() => Some(pair.clone()),
@@ -305,8 +312,11 @@ impl KnownCandidate {
     pub fn matches(&self, track: &str, baseline: &str) -> bool {
         let Some(media) = self.candidate.sha256.as_deref() else { return false };
         if !digest_valid(baseline) || media == baseline || self.cache_key(track).is_none() { return false; }
-        if let Some(pair) = &self.pair_sha256 { return *pair == pair_digest(track, baseline, media); }
-        self.baseline_sha256.as_deref() == Some(baseline) || self.baseline_sha256s.iter().any(|s| s == baseline)
+        if self.baseline_sha256.as_deref() == Some(baseline) || self.baseline_sha256s.iter().any(|s| s == baseline) {
+            return true;
+        }
+        let expected = pair_digest(track, baseline, media);
+        self.pair_sha256.as_ref() == Some(&expected) || self.pair_sha256s.contains(&expected)
     }
 }
 
@@ -478,7 +488,7 @@ fn deliver_known<T>(
     if !current() || next.candidate.ticket == hit.candidate.ticket || next.candidate.source != hit.candidate.source
         || next.candidate.sha256 != hit.candidate.sha256 || next.proof_catalog_id != hit.proof_catalog_id
         || next.baseline_sha256 != hit.baseline_sha256 || next.baseline_sha256s != hit.baseline_sha256s
-        || next.pair_sha256 != hit.pair_sha256 { return None; }
+        || next.pair_sha256s != hit.pair_sha256s || next.pair_sha256 != hit.pair_sha256 { return None; }
     fetch(&next.candidate).inspect_err(|e| {
         if current() { crate::config::log(format!("Повторная доставка проверенной версии: {}", e.label())); }
     }).ok()
@@ -599,6 +609,34 @@ mod tests {
         assert!(!personal.matches("7", &c));
         assert!(!hit(serde_json::json!({"baseline_sha256":a,"pair_sha256":commitment})).matches("7", &a));
         assert!(!hit(serde_json::json!({"baseline_sha256s":[a],"pair_sha256":commitment})).matches("7", &a));
+    }
+
+    #[test]
+    fn alternate_commitments_still_bind_each_quality_to_the_exact_media_and_id() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let media = "c".repeat(64);
+        let first = pair_digest("17", &a, &media);
+        let second = pair_digest("17", &b, &media);
+        let row = serde_json::json!({"source":"YouTube Music","ticket":"1".repeat(32),"sha256":media,
+                                     "pair_sha256":first,"pair_sha256s":[second]});
+        let hit: KnownCandidate = serde_json::from_value(row.clone()).unwrap();
+        assert!(hit.matches("17", &a) && hit.matches("17", &b));
+        assert!(!hit.matches("18", &b) && !hit.matches("17", &"d".repeat(64)));
+        let mut different = row.clone();
+        different["sha256"] = "d".repeat(64).into();
+        assert!(!serde_json::from_value::<KnownCandidate>(different).unwrap().matches("17", &b));
+        for invalid in [vec![first.clone()], vec![second.clone(), second.clone()], vec![media.clone()],
+                        vec!["bad".into()], (0..9).map(|n| format!("{n:064x}")).collect()] {
+            let mut value = row.clone();
+            value["pair_sha256s"] = serde_json::json!(invalid);
+            assert!(!serde_json::from_value::<KnownCandidate>(value).unwrap().valid("17"));
+        }
+        let mut operator = row;
+        operator.as_object_mut().unwrap().remove("pair_sha256");
+        operator["baseline_sha256"] = a.clone().into();
+        let operator: KnownCandidate = serde_json::from_value(operator).unwrap();
+        assert!(operator.matches("17", &a) && operator.matches("17", &b));
     }
 
     fn json_response(status: u16, body: &serde_json::Value) -> reqwest::blocking::Response {
