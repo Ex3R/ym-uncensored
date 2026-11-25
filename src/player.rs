@@ -1,6 +1,9 @@
 //! Аудио-движок: очередь, загрузка и предзагрузка треков, фидбек волне, воспроизведение.
 //! Живёт в своём потоке, UI шлёт ему команды и читает `Shared`.
 
+#[path = "candidate_downloads.rs"]
+mod candidate_downloads;
+
 use crate::ahead::Ahead;
 use crate::api::{Account, Api, Batch, Res, Track, WaveSession, WAVE};
 use crate::config::log;
@@ -530,7 +533,7 @@ fn load_for_playback(
 }
 
 fn resolve_track(
-    api: &Api, t: &Track, buf: Arc<Buf>, current: &impl Fn() -> bool, retry: &std::cell::Cell<bool>,
+    api: &Api, t: &Track, buf: Arc<Buf>, current: &(impl Fn() -> bool + Clone + Send + 'static), retry: &std::cell::Cell<bool>,
 ) -> Option<Audio> {
     use crate::{originals, verification::Recording};
     let revision = crate::resolver_login::session_revision();
@@ -583,36 +586,29 @@ fn resolve_track(
         let candidates = originals::online_candidates(t).inspect_err(|_| { retry.set(true); log("Замена: внешний поиск недоступен"); }).unwrap_or_default();
         log(format!("Замена {}: внешних кандидатов {}", t.id, candidates.len()));
         let next = candidates.first().and_then(|candidate| candidate.next.clone());
-        let original_digest = std::cell::OnceCell::new();
-        let original_digest = || original_digest.get_or_init(|| originals::media_digest(buf.reader()).ok()).as_deref();
-        let try_external = |candidates: Vec<originals::OnlineCandidate>| {
-            for candidate in candidates {
+        // Start network I/O even if the original catalog stream is still arriving.
+        // Local cache reuse needs a complete baseline and fresh proofs always bind both files.
+        let original_hash = if buf.done() { originals::complete_digest(&buf, current) } else { None };
+        let cache_hash = original_hash.clone();
+        let requested = t.clone();
+        return candidate_downloads::first_verified(
+            candidates, next, current.clone(), originals::online_next,
+            move |candidate, active| originals::online_audio(candidate, &requested, cache_hash.as_deref(), &active),
+            |incoming| {
+                let (candidate, result) = incoming.inspect_err(|_| {
+                    retry.set(true);
+                    log("Замена: не удалось получить кандидата");
+                }).ok()?;
+                let decoder = open_decoder(&result.buf).ok()?;
+                let audio = (result.buf.clone(), decoder, result.format.clone());
+                let audio = if result.cached { audio } else { check(audio)? };
                 if !current() { return None; }
-                if let Ok(result) = originals::online_audio(&candidate,t,original_digest(),current)
-                    .inspect_err(|_| { retry.set(true); log("Замена: ошибка загрузки аудио"); }) {
-                    if let Ok(decoder) = open_decoder(&result.buf) {
-                        let audio = (result.buf.clone(),decoder,result.format.clone());
-                        if !current() { return None; }
-                        if result.cached {
-                            log(format!("Замена {}: подтверждённое аудио из кэша",t.id));
-                            // Migrate a previously verified, baseline-bound v0.2.2 cache hit.
-                            originals::remember_external(result, &candidate, t.catalog_id(), original_digest());
-                            return Some(audio);
-                        }
-                        if let Some(audio) = check(audio) {
-                            originals::remember_external(result,&candidate,t.catalog_id(),original_digest());
-                            return Some(audio);
-                        }
-                    }
-                }
-            }
-            None
-        };
-        if let Some(audio) = try_external(candidates) { return Some(audio); }
-        if !current() { return None; }
-        if let Some(next) = next {
-            if let Some(audio) = try_external(originals::online_next(&next).inspect_err(|_| retry.set(true)).unwrap_or_default()) { return Some(audio); }
-        }
+                let proof = original_hash.clone().or_else(|| originals::complete_digest(&buf, current))?;
+                if !current() { return None; }
+                originals::remember_external(result, &candidate, t.catalog_id(), Some(&proof));
+                Some(audio)
+            },
+        );
     }
     None
 }
@@ -2409,7 +2405,8 @@ impl Engine {
         let job = Arc::downgrade(&check.owner);
         let tx = self.tx.clone();
         *self.pending_replacement.lock().unwrap() = Some(Box::new(move || {
-            let current = || job.strong_count() > 0 && replacements_enabled()
+            let load = job.clone();
+            let current = move || load.strong_count() > 0 && replacements_enabled()
                 && crate::resolver_login::session_revision() == revision;
             if !current() { return; }
             let credential = crate::resolver_login::credential();
