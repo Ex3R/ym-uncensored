@@ -1718,29 +1718,36 @@ impl Api {
         self.lyrics_until(track_id, None)
     }
 
-    /// A public reference for this recording, requested under the separate sources session.
+    /// A recording-specific reference for verifying an audible change.
     pub(crate) fn reference_lyrics(&self, track: &Track) -> Res<Option<Lyrics>> {
+        if !track.version.is_empty() { return Ok(None); }
+        Ok(self.album_references(track)?.into_iter().max_by_key(|lyrics| !lyrics.synced.is_empty()))
+    }
+
+    /// A base song on the same album may identify the language of a versioned track.
+    /// Only the classification leaves this method, so these lyrics cannot verify a replacement.
+    pub(crate) fn reference_language(&self, track: &Track) -> Res<Option<bool>> {
+        Ok(reference_language_agreement(&self.album_references(track)?))
+    }
+
+    fn album_references(&self, track: &Track) -> Res<Vec<Lyrics>> {
         use std::io::Read;
-        let Some(session) = crate::resolver_login::credential() else { return Ok(None) };
-        if track.artists.is_empty() || track.album_title.is_empty() || !track.version.is_empty() {
-            return Ok(None);
+        if !crate::originals::can_match(track) || track.title.trim().is_empty() || track.artist_list.is_empty()
+            || track.artist_list.iter().any(|artist| artist.name.trim().is_empty()) || track.album_title.trim().is_empty() {
+            return Ok(Vec::new());
         }
+        let Some(session) = crate::resolver_login::credential() else { return Ok(Vec::new()) };
+        // The server verifies title, complete artist credit and duration. The album is checked locally.
         let body = serde_json::to_vec(&json!({
             "title":track.title, "artists":track.artist_list.iter().map(|a| &a.name).collect::<Vec<_>>(),
             "duration_ms":track.duration_ms,
         })).map_err(|e| e.to_string())?;
         let response = crate::resolver_login::signed("POST", "/reference", &session, body)?
             .timeout(Duration::from_secs(15)).send().map_err(|e| e.to_string())?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND { return Ok(None); }
+        if response.status() == reqwest::StatusCode::NOT_FOUND { return Ok(Vec::new()); }
         let response = response.error_for_status().map_err(|e| e.to_string())?;
         let editions: Vec<Value> = serde_json::from_reader(response.take(262145)).map_err(|e| e.to_string())?;
-        let album = track.album_title.trim().to_lowercase();
-        let Some(data) = editions.iter().filter(|row| row["albumName"].as_str()
-            .is_some_and(|name| name.trim().to_lowercase() == album))
-            .max_by_key(|row| row["syncedLyrics"].as_str().is_some_and(|text| !text.is_empty())) else { return Ok(None) };
-        let text = data["plainLyrics"].as_str().unwrap_or("").lines().map(str::to_owned).collect();
-        let synced = parse_lrc(data["syncedLyrics"].as_str().unwrap_or(""));
-        Ok(Some(Lyrics { text, synced, ..Default::default() }))
+        Ok(matching_album_lyrics(&track.album_title, &editions))
     }
 
     pub(crate) fn lyrics_until(&self, track_id: &str, deadline: Option<Instant>) -> Res<Lyrics> {
@@ -1934,8 +1941,37 @@ impl Api {
     }
 }
 
+fn matching_album_lyrics(album: &str, editions: &[Value]) -> Vec<Lyrics> {
+    let album = album.trim().to_lowercase();
+    editions.iter().filter(|row| !album.is_empty() && row["albumName"].as_str()
+        .is_some_and(|name| name.trim().to_lowercase() == album))
+        .map(|row| Lyrics {
+            text: row["plainLyrics"].as_str().unwrap_or("").lines().map(str::to_owned).collect(),
+            synced: parse_lrc(row["syncedLyrics"].as_str().unwrap_or("")),
+            ..Default::default()
+        }).collect()
+}
+
+fn reference_language_agreement(editions: &[Lyrics]) -> Option<bool> {
+    let mut languages = editions.iter().map(crate::language::lyrics_language);
+    let first = languages.next()??;
+    languages.all(|language| language == Some(first)).then_some(first)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_matching_album_lyrics_can_classify_a_versioned_track() {
+        let russian = serde_json::json!({"albumName":"Album","plainLyrics":"Сегодня мы разговариваем на русском языке."});
+        let english = serde_json::json!({"albumName":"Another Album","plainLyrics":"The sunlight shines through an open window."});
+        let rows = [russian.clone(), english.clone()];
+        assert_eq!(super::reference_language_agreement(&super::matching_album_lyrics("album", &rows)), Some(true));
+        assert_eq!(super::reference_language_agreement(&super::matching_album_lyrics("Unknown", &rows)), None);
+        let mut ambiguous = english;
+        ambiguous["albumName"] = "Album".into();
+        assert_eq!(super::reference_language_agreement(&super::matching_album_lyrics("Album", &[russian, ambiguous])), None);
+    }
+
     use super::*;
 
     #[test]

@@ -107,14 +107,21 @@ pub fn should_uncensor(
     let title = normalized(&track.title);
     if crate::language::russian_title(title_variant(&title).0) { return true; }
     api.originals.russian.find(&track.id, || {
-        if track.lyrics || title.chars().any(|c| matches!(c, 'а'..='я' | 'ё')) {
+        let language = if track.lyrics || title.chars().any(|c| matches!(c, 'а'..='я' | 'ё')) {
             match text_language() {
-                Ok(Some(russian)) => return Ok(Some(russian)),
+                Ok(Some(russian)) => Some(russian),
+                Ok(None) => vocals(),
                 Err(e) => return if vocals() == Some(true) { Ok(Some(true)) } else { Err(e) },
-                Ok(None) => {}
             }
-        }
-        vocals().map(Some).ok_or_else(|| "язык не определён".into())
+        } else {
+            // A Latin title and a missing catalog lyrics flag can still accompany Russian vocals.
+            // Consult the exact public lyrics only when the local language probe is inconclusive.
+            match vocals() {
+                Some(russian) => Some(russian),
+                None => text_language()?,
+            }
+        };
+        language.map(Some).ok_or_else(|| "язык не определён".into())
     }).unwrap_or(false)
 }
 
@@ -903,6 +910,9 @@ mod tests {
         let foreign = make(3, "Without Me");
         assert!(!should_uncensor(&api, &foreign, || Ok(None), || Some(false)));
         assert!(!should_uncensor(&api, &foreign, || Ok(None), || panic!("cached foreign language")));
+        let mixed = make(5, "Latin title");
+        assert!(should_uncensor(&api, &mixed, || Ok(Some(true)), || None));
+        assert!(!should_uncensor(&api, &make(6, "Foreign vocals"), || panic!("known vocal language"), || Some(false)));
         let unknown = make(4, "Instrumental");
         assert!(!should_uncensor(&api, &unknown, || Ok(None), || None));
     }

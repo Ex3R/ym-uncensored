@@ -181,6 +181,7 @@ pub type Likes = Arc<Mutex<HashSet<String>>>;
 struct VerificationGate {
     state: Mutex<VerificationGateState>,
     changed: Condvar,
+    speculative_download: Arc<Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -215,11 +216,11 @@ impl VerificationGate {
         ForegroundReservation(self.clone())
     }
 
-    fn enter(self: &Arc<Self>, foreground: bool, current: &dyn Fn() -> bool) -> Option<VerificationPermit> {
+    fn enter(self: &Arc<Self>, foreground: &std::sync::atomic::AtomicBool, current: &dyn Fn() -> bool) -> Option<VerificationPermit> {
         let mut state = self.state.lock().unwrap();
         loop {
             if !current() { return None; }
-            if !state.verifying && (foreground || state.foreground_pending == 0) {
+            if !state.verifying && (foreground.load(std::sync::atomic::Ordering::Acquire) || state.foreground_pending == 0) {
                 state.verifying = true;
                 return Some(VerificationPermit(self.clone()));
             }
@@ -229,19 +230,63 @@ impl VerificationGate {
     }
 }
 
-#[derive(Clone)]
-struct VerificationContext {
+struct VerificationLane {
     gate: Arc<VerificationGate>,
-    foreground: bool,
+    foreground: std::sync::atomic::AtomicBool,
+    active: std::sync::atomic::AtomicBool,
+    reservation: Mutex<Option<ForegroundReservation>>,
 }
 
-fn speculative_download_slot<'a>(lock: &'a Mutex<()>, active: &dyn Fn() -> bool) -> Option<MutexGuard<'a, ()>> {
+impl VerificationLane {
+    fn new(gate: Arc<VerificationGate>, foreground: bool) -> Arc<Self> {
+        let reservation = foreground.then(|| gate.reserve_foreground());
+        Arc::new(Self {
+            gate,
+            foreground: std::sync::atomic::AtomicBool::new(foreground),
+            active: std::sync::atomic::AtomicBool::new(true),
+            reservation: Mutex::new(reservation),
+        })
+    }
+
+    fn promote(&self) {
+        let mut reservation = self.reservation.lock().unwrap();
+        if self.active.load(std::sync::atomic::Ordering::Acquire)
+            && !self.foreground.load(std::sync::atomic::Ordering::Acquire)
+        {
+            *reservation = Some(self.gate.reserve_foreground());
+            self.foreground.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn release(&self) {
+        self.active.store(false, std::sync::atomic::Ordering::Release);
+        self.reservation.lock().unwrap().take();
+    }
+
+    fn enter(&self, current: &dyn Fn() -> bool) -> Option<VerificationPermit> {
+        self.gate.enter(&self.foreground, current)
+    }
+}
+
+struct VerificationLaneRelease(Arc<VerificationLane>);
+
+impl Drop for VerificationLaneRelease {
+    fn drop(&mut self) { self.0.release(); }
+}
+
+#[derive(Clone)]
+struct VerificationContext {
+    lane: Arc<VerificationLane>,
+}
+
+fn speculative_download_slot<'a>(lock: &'a Mutex<()>, lane: &VerificationLane, active: &dyn Fn() -> bool) -> Result<Option<MutexGuard<'a, ()>>, ()> {
     loop {
-        if !active() { return None; }
+        if !active() { return Err(()); }
+        if lane.foreground.load(std::sync::atomic::Ordering::Acquire) { return Ok(None); }
         match lock.try_lock() {
-            Ok(guard) => return Some(guard),
+            Ok(guard) => return Ok(Some(guard)),
             Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(50)),
-            Err(TryLockError::Poisoned(error)) => return Some(error.into_inner()),
+            Err(TryLockError::Poisoned(error)) => return Ok(Some(error.into_inner())),
         }
     }
 }
@@ -447,6 +492,7 @@ struct ReplacementCheck {
     owner: Arc<()>,
     finished: bool,
     audio: Option<Audio>,
+    verification_lane: Option<Arc<VerificationLane>>,
 }
 
 impl ReplacementCheck {
@@ -609,6 +655,7 @@ fn resolve_track(
     let revision = crate::resolver_login::session_revision();
     let lyrics = std::cell::OnceCell::new();
     let reference_text = || lyrics.get_or_init(|| {
+        if !current() { return Ok(None); }
         let result = api.reference_lyrics(t);
         if let Ok(Some(_)) = &result { return result; }
         if t.lyrics {
@@ -622,7 +669,16 @@ fn resolve_track(
         result
     }).as_ref().map_err(|e| { retry.set(true); e.clone() });
     let eligible = current() && replacements_enabled() && originals::should_uncensor(api, t,
-        || reference_text().map(|l| l.as_ref().and_then(crate::language::lyrics_language)),
+        || {
+            if !t.version.is_empty() && current() {
+                match api.reference_language(t) {
+                    Ok(Some(russian)) => return Ok(Some(russian)),
+                    Err(error) if !t.lyrics => { retry.set(true); return Err(error); }
+                    _ => {}
+                }
+            }
+            reference_text().map(|l| l.as_ref().and_then(crate::language::lyrics_language))
+        },
         || crate::language::vocal_language(open_decoder(&buf).ok()?, t.duration_ms));
     if eligible {
         log(format!("Замена {}: подбор", t.id));
@@ -630,7 +686,7 @@ fn resolve_track(
         let check = |candidate: Audio| -> Option<Audio> {
             if !current() { return None; }
             let _permit = match verification {
-                Some(context) => Some(context.gate.enter(context.foreground, current)?),
+                Some(context) => Some(context.lane.enter(current)?),
                 None => None,
             };
             let reference = baseline.get_or_init(|| Recording::decode(open_decoder(&buf).ok()?, t.duration_ms)).as_ref().or_else(|| { log("Замена: исходное аудио не декодировано"); None })?;
@@ -665,7 +721,9 @@ fn resolve_track(
         let original_hash = if buf.done() { originals::complete_digest(&buf, current) } else { None };
         let cache_hash = original_hash.clone();
         let requested = t.clone();
-        let fetch_limit = verification.filter(|context| !context.foreground).map(|_| Arc::new(Mutex::new(())));
+        let fetch_limit = verification
+            .filter(|context| !context.lane.foreground.load(std::sync::atomic::Ordering::Acquire))
+            .map(|context| (context.lane.gate.speculative_download.clone(), context.lane.clone()));
         return candidate_downloads::first_verified(
             candidates, next, current.clone(),
             |ticket| {
@@ -674,8 +732,8 @@ fn resolve_track(
                 Ok((items, next))
             },
             move |candidate, active| {
-                let _slot = if let Some(limit) = &fetch_limit {
-                    Some(speculative_download_slot(limit, &active).ok_or_else(|| "cancelled".to_owned())?)
+                let _slot = if let Some((limit, lane)) = &fetch_limit {
+                    speculative_download_slot(limit, lane, &active).map_err(|_| "cancelled".to_owned())?
                 } else { None };
                 originals::online_audio(candidate, &requested, cache_hash.as_deref(), &active)
             },
@@ -2269,6 +2327,11 @@ impl Engine {
         self.current_check = self.next_check.take().filter(|c| {
             replacements_enabled() && c.matches(&t, crate::resolver_login::session_revision())
         });
+        if let Some(lane) = self.current_check.as_ref().and_then(|check| {
+            (!check.finished).then_some(check.verification_lane.as_ref()).flatten()
+        }) {
+            lane.promote();
+        }
         // Как у оригинала, трек начат сразу, а не когда докачался: иначе пропуск до загрузки
         // не доходит до волны, и она отдаёт этот трек снова.
         self.begin_listen(&t, false);
@@ -2343,6 +2406,7 @@ impl Engine {
                 let finished = matches!(loaded.known, KnownStatus::Verified(..));
                 self.current_check = Some(ReplacementCheck {
                     id: track.id.clone(), revision, owner: owner.clone(), finished, audio: None,
+                    verification_lane: None,
                 });
                 if let KnownStatus::Verified(_, audio) = loaded.known { return (audio, FirstBuffer::Known); }
             }
@@ -2428,7 +2492,7 @@ impl Engine {
                 let owner = self.current_load.insert(Arc::new(())).clone();
                 let job = Arc::downgrade(&owner);
                 self.next_check = None;
-                self.current_check = Some(ReplacementCheck { id: track.id.clone(), revision, owner, finished: false, audio: None });
+                self.current_check = Some(ReplacementCheck { id: track.id.clone(), revision, owner, finished: false, audio: None, verification_lane: None });
                 let tx = self.tx.clone();
                 thread::spawn(move || {
                     let current = || job.strong_count() > 0 && replacements_enabled() && crate::resolver_login::session_revision() == revision;
@@ -2501,14 +2565,18 @@ impl Engine {
         let api = self.api.clone()?;
         let check = ReplacementCheck {
             id: track.id.clone(), revision, owner: Arc::new(()), finished: false, audio: None,
+            verification_lane: None,
         };
         let job = Arc::downgrade(&check.owner);
         let tx = self.tx.clone();
-        let gate = self.verification_gate.clone();
-        let reservation = foreground.then(|| gate.reserve_foreground());
-        let verification = VerificationContext { gate, foreground };
+        let lane = VerificationLane::new(self.verification_gate.clone(), foreground);
+        let verification_lane = lane.clone();
+        let release_lane = VerificationLaneRelease(lane.clone());
+        let verification = VerificationContext { lane };
+        let mut check = check;
+        check.verification_lane = Some(verification_lane);
         let task: Job = Box::new(move || {
-            let _reservation = reservation;
+            let _release_lane = release_lane;
             let load = job.clone();
             let current = move || load.strong_count() > 0 && replacements_enabled()
                 && crate::resolver_login::session_revision() == revision;
@@ -2965,7 +3033,10 @@ mod tests {
     }
 
     fn check_queue_promotion(list: bool) {
-        let track = |id| crate::api::parse_track(&serde_json::json!({"id":id,"title":"Track"})).unwrap();
+        let track = |id| crate::api::parse_track(&serde_json::json!({
+            "id":id,"title":"Track","durationMs":120000,
+            "artists":[{"id":1,"name":"Test Artist"}]
+        })).unwrap();
         let mut e = Engine::new(mpsc::channel().0, Default::default(), Default::default(), Arc::new(|| {}), Default::default());
         // Drive completions ourselves, without network requests or an audio device.
         let (wakeup, _rx) = mpsc::sync_channel(1);
@@ -3024,8 +3095,9 @@ mod tests {
         e.api=Some(Api::new(""));
         e.current=Some(current.clone());
         e.current_lookup_revision=Some(revision);
-        e.current_check=Some(ReplacementCheck { id:current.id, revision, owner:Arc::new(()), finished:false, audio:None });
+        e.current_check=Some(ReplacementCheck { id:current.id, revision, owner:Arc::new(()), finished:false, audio:None, verification_lane:None });
         e.loaded=true;
+        e.paused=false;
         e.queue.push_back(next.clone());
         e.prefetch=Some((next.id.clone(),LoadedTrack { baseline:make_audio("prefetch baseline"), known:KnownStatus::Miss(revision) }));
 
@@ -3065,11 +3137,11 @@ mod tests {
         let foreground=gate.reserve_foreground();
         let current=Arc::new(std::sync::atomic::AtomicBool::new(true));
         let probe=current.clone();
-        let low_gate=gate.clone();
+        let low_lane=VerificationLane::new(gate.clone(),false);
         let (tx,rx)=mpsc::channel();
         let low=thread::spawn(move || {
             let active=|| probe.load(std::sync::atomic::Ordering::Acquire);
-            let permit=low_gate.enter(false,&active);
+            let permit=low_lane.enter(&active);
             tx.send(permit.is_some()).unwrap();
         });
         assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(),"next ASR must wait while the current resolver owns priority");
@@ -3083,12 +3155,13 @@ mod tests {
     fn verification_gate_serializes_foreground_and_one_prefetch() {
         let gate=Arc::new(VerificationGate::default());
         let reservation=gate.reserve_foreground();
-        let foreground=gate.enter(true,&|| true).expect("foreground gets the reserved verifier");
-        let low_gate=gate.clone();
+        let foreground_lane=VerificationLane::new(gate.clone(),true);
+        let foreground=foreground_lane.enter(&|| true).expect("foreground gets the reserved verifier");
+        let low_lane=VerificationLane::new(gate.clone(),false);
         let (entered_tx,entered_rx)=mpsc::channel();
         let (release_tx,release_rx)=mpsc::channel();
         let low=thread::spawn(move || {
-            let permit=low_gate.enter(false,&|| true).unwrap();
+            let permit=low_lane.enter(&|| true).unwrap();
             entered_tx.send(()).unwrap();
             release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             drop(permit);
@@ -3096,10 +3169,35 @@ mod tests {
         assert!(entered_rx.recv_timeout(Duration::from_millis(150)).is_err(),"prefetch cannot run ASR beside current");
         drop(foreground);
         assert!(entered_rx.recv_timeout(Duration::from_millis(150)).is_err(),"reservation keeps priority until current resolver completes");
+        foreground_lane.release();
         drop(reservation);
         entered_rx.recv_timeout(Duration::from_secs(1)).expect("one prefetch may use the verifier after current completes");
         release_tx.send(()).unwrap();
         low.join().unwrap();
+    }
+
+    #[test]
+    fn promoted_prefetch_uses_foreground_priority_and_download_capacity() {
+        let gate=Arc::new(VerificationGate::default());
+        let blocker=gate.reserve_foreground();
+        let occupied=gate.enter(&std::sync::atomic::AtomicBool::new(true),&|| true).unwrap();
+        let later_foreground=gate.reserve_foreground();
+        let lane=VerificationLane::new(gate.clone(),false);
+        let waiter_lane=lane.clone();
+        let (tx,rx)=mpsc::channel();
+        let waiter=thread::spawn(move || {
+            let permit=waiter_lane.enter(&|| true).unwrap();
+            tx.send(()).unwrap();
+            drop(permit);
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(150)).is_err());
+        lane.promote();
+        assert!(lane.foreground.load(std::sync::atomic::Ordering::Acquire));
+        drop(occupied);
+        rx.recv_timeout(Duration::from_secs(1)).expect("promoted check proceeds ahead of later foreground work");
+        waiter.join().unwrap();
+        drop(later_foreground);
+        drop(blocker);
     }
 
     #[test]
@@ -3111,6 +3209,7 @@ mod tests {
         let job = Arc::downgrade(&owner);
         e.next_check = Some(ReplacementCheck {
             id: next.id.clone(), revision: crate::resolver_login::session_revision(), owner, finished: false, audio: None,
+            verification_lane: None,
         });
         e.queue.push_back(next);
         e.play_from_queue();
