@@ -124,18 +124,27 @@ impl Default for Config {
 /// Separate settings and account credentials for this application.
 pub fn dir() -> PathBuf {
     #[cfg(test)]
-    if let Some(path) = std::env::var_os("YM_TEST_PROFILE") { return path.into(); }
+    {
+        if let Some(path) = std::env::var_os("YM_TEST_PROFILE") { return path.into(); }
+        // Ordinary unit tests must never pick up the installed player's login,
+        // caches or preferences. Live integration tests opt in to their own profile.
+        static PROFILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        PROFILE.get_or_init(|| std::env::temp_dir().join(format!("ym-unit-profile-{}-{}",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap().as_nanos()))).clone()
+    }
+    #[cfg(not(test))]
     crate::sys::config_base().join("ancensor")
 }
 
 /// Скачанные шрифты и значки. На Windows лежат рядом с настройками, на Linux — в ~/.cache.
 pub fn cache_dir() -> PathBuf {
     #[cfg(test)]
-    if let Some(path) = std::env::var_os("YM_TEST_PROFILE") { return PathBuf::from(path).join("cache"); }
-    #[cfg(windows)]
-    return dir();
-    #[cfg(not(windows))]
-    return crate::sys::cache_base().join("ancensor");
+    { dir().join("cache") }
+    #[cfg(all(windows,not(test)))]
+    { dir() }
+    #[cfg(all(not(windows),not(test)))]
+    { crate::sys::cache_base().join("ancensor") }
 }
 
 /// Что писать в `token_plain`: открытым текстом токен хранится только там, где связки ключей

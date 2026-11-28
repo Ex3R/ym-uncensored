@@ -232,8 +232,52 @@ pub struct SyncLine {
     pub text: String,
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) struct OmissionCheck {
+    pub from_ms: u32,
+    pub to_ms: u32,
+    pub missing: String,
+    pub before: [String; 2],
+    pub after: [String; 2],
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) enum OmissionPlan {
+    #[default]
+    Legacy,
+    Incomplete,
+    Complete(Vec<OmissionCheck>),
+}
+
+impl OmissionPlan {
+    fn from_row(row: &Value, duration_ms: u64) -> Self {
+        if row["acousticPlainLyrics"].as_bool() == Some(true) && row["omissionChecksIncomplete"].as_bool() == Some(true)
+            && row.get("syncedLyrics").is_none() && row.get("omissionChecks").is_none()
+            && row["plainLyrics"].as_str().is_some_and(|text| !text.trim().is_empty()) { return Self::Legacy; }
+        if row.get("omissionChecksIncomplete").is_some_and(|v| v.as_bool() != Some(false)) {
+            return Self::Incomplete;
+        }
+        let Some(raw) = row.get("omissionChecks") else { return Self::Legacy };
+        let Some(list) = raw.as_array().filter(|rows| rows.len() <= 64) else { return Self::Incomplete };
+        let mut checks = Vec::with_capacity(list.len());
+        for item in list {
+            let Ok(check) = serde_json::from_value::<OmissionCheck>(item.clone()) else { return Self::Incomplete };
+            let words = [&check.missing].into_iter().chain(&check.before).chain(&check.after);
+            if check.to_ms <= check.from_ms || check.to_ms - check.from_ms > 8900
+                || u64::from(check.to_ms) > duration_ms || words.into_iter().any(|w|
+                    w.is_empty() || w.chars().count() > 64 || !w.chars().all(|c| ('а'..='я').contains(&c))) {
+                return Self::Incomplete;
+            }
+            checks.push(check);
+        }
+        checks.sort_by_key(|c| (c.from_ms, c.to_ms));
+        Self::Complete(checks)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Lyrics {
+    pub(crate) omission_plan: OmissionPlan,
     /// Пустой текст — проигрыш: строка есть, но не видна.
     pub synced: Vec<SyncLine>,
     /// Правообладатель текста («Источник: …»).
@@ -1747,7 +1791,7 @@ impl Api {
         if response.status() == reqwest::StatusCode::NOT_FOUND { return Ok(Vec::new()); }
         let response = response.error_for_status().map_err(|e| e.to_string())?;
         let editions: Vec<Value> = serde_json::from_reader(response.take(262145)).map_err(|e| e.to_string())?;
-        Ok(matching_album_lyrics(&track.album_title, &editions))
+        Ok(matching_album_lyrics(&track.album_title, &editions, track.duration_ms))
     }
 
     pub(crate) fn lyrics_until(&self, track_id: &str, deadline: Option<Instant>) -> Res<Lyrics> {
@@ -1941,15 +1985,20 @@ impl Api {
     }
 }
 
-fn matching_album_lyrics(album: &str, editions: &[Value]) -> Vec<Lyrics> {
+pub(crate) fn reference_row(row: &Value, duration_ms: u64) -> Lyrics {
+    Lyrics {
+        text: row["plainLyrics"].as_str().unwrap_or("").lines().map(str::to_owned).collect(),
+        synced: parse_lrc(row["syncedLyrics"].as_str().unwrap_or("")),
+        omission_plan: OmissionPlan::from_row(row, duration_ms),
+        ..Default::default()
+    }
+}
+
+fn matching_album_lyrics(album: &str, editions: &[Value], duration_ms: u64) -> Vec<Lyrics> {
     let album = album.trim().to_lowercase();
     editions.iter().filter(|row| !album.is_empty() && row["albumName"].as_str()
         .is_some_and(|name| name.trim().to_lowercase() == album))
-        .map(|row| Lyrics {
-            text: row["plainLyrics"].as_str().unwrap_or("").lines().map(str::to_owned).collect(),
-            synced: parse_lrc(row["syncedLyrics"].as_str().unwrap_or("")),
-            ..Default::default()
-        }).collect()
+        .map(|row| reference_row(row, duration_ms)).collect()
 }
 
 fn reference_language_agreement(editions: &[Lyrics]) -> Option<bool> {
@@ -1961,15 +2010,38 @@ fn reference_language_agreement(editions: &[Lyrics]) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn signed_omission_plan_distinguishes_legacy_empty_and_unusable_rows() {
+        let read = |row| reference_row(&row, 10_000).omission_plan;
+        let check = json!({"from_ms":10, "to_ms":8900, "before":["я","и"], "after":["его","в"], "missing":"слово"});
+        assert!(matches!(read(json!({})), OmissionPlan::Legacy));
+        assert!(matches!(read(json!({"omissionChecks":[]})), OmissionPlan::Complete(v) if v.is_empty()));
+        assert!(matches!(read(json!({"omissionChecks":[check.clone()]})), OmissionPlan::Complete(v) if v.len() == 1));
+        assert!(matches!(read(json!({"acousticPlainLyrics":true, "omissionChecksIncomplete":true, "plainLyrics":"слова"})), OmissionPlan::Legacy));
+        for row in [
+            json!({"omissionChecksIncomplete":true}), json!({"omissionChecksIncomplete":"false"}),
+            json!({"acousticPlainLyrics":true, "omissionChecksIncomplete":true,"plainLyrics":"слова","syncedLyrics":"malformed"}),
+            json!({"omissionChecks":null}), json!({"omissionChecks":vec![check.clone(); 65]}),
+        ] {
+            assert!(matches!(read(row), OmissionPlan::Incomplete));
+        }
+        for (field, bad) in [("before",json!(["а"])), ("missing",json!("два слова")), ("to_ms",json!(0)),
+                             ("from_ms",json!(-1)), ("to_ms",json!(8911)), ("to_ms",json!(11_000))] {
+            let mut bad_check = check.clone();
+            bad_check[field] = bad;
+            assert!(matches!(read(json!({"omissionChecks":[check.clone(),bad_check]})), OmissionPlan::Incomplete));
+        }
+    }
+
+    #[test]
     fn only_matching_album_lyrics_can_classify_a_versioned_track() {
         let russian = serde_json::json!({"albumName":"Album","plainLyrics":"Сегодня мы разговариваем на русском языке."});
         let english = serde_json::json!({"albumName":"Another Album","plainLyrics":"The sunlight shines through an open window."});
         let rows = [russian.clone(), english.clone()];
-        assert_eq!(super::reference_language_agreement(&super::matching_album_lyrics("album", &rows)), Some(true));
-        assert_eq!(super::reference_language_agreement(&super::matching_album_lyrics("Unknown", &rows)), None);
+        assert_eq!(super::reference_language_agreement(&super::matching_album_lyrics("album", &rows, 1000)), Some(true));
+        assert_eq!(super::reference_language_agreement(&super::matching_album_lyrics("Unknown", &rows, 1000)), None);
         let mut ambiguous = english;
         ambiguous["albumName"] = "Album".into();
-        assert_eq!(super::reference_language_agreement(&super::matching_album_lyrics("Album", &[russian, ambiguous])), None);
+        assert_eq!(super::reference_language_agreement(&super::matching_album_lyrics("Album", &[russian, ambiguous], 1000)), None);
     }
 
     use super::*;

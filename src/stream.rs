@@ -57,7 +57,7 @@ impl Buf {
     pub fn from_complete_file(file: File, len: u64) -> Arc<Self> {
         Arc::new(Buf {
             file,
-            state: Mutex::new(State { have: len, len: Some(len), done: true, err: None }),
+            state: Mutex::new(State { have: len, len: Some(len), done: true, ..State::default() }),
             cv: Condvar::new(),
         })
     }

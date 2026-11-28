@@ -566,6 +566,7 @@ const FIRST_BUFFER_WAIT: Duration = Duration::from_secs(7);
 
 enum KnownEvent {
     Found,
+    Reviewing,
     Verified(Audio),
 }
 
@@ -575,6 +576,7 @@ fn initial_status(events: &Receiver<KnownEvent>, revision: u64, wait: Duration) 
         match events.recv_timeout(timeout) {
             Ok(KnownEvent::Verified(audio)) => return KnownStatus::Verified(revision, audio),
             Ok(KnownEvent::Found) => timeout = wait,
+            Ok(KnownEvent::Reviewing) => return KnownStatus::Pending(revision),
             Err(RecvTimeoutError::Disconnected) => return KnownStatus::Miss(revision),
             Err(RecvTimeoutError::Timeout) => return KnownStatus::Pending(revision),
         }
@@ -583,25 +585,54 @@ fn initial_status(events: &Receiver<KnownEvent>, revision: u64, wait: Duration) 
 
 fn verified_known(
     api: &Api, track: &Track, current: &impl Fn() -> bool,
-    found: impl FnOnce() -> bool, baseline: impl FnOnce() -> Option<Arc<Buf>>,
+    found: impl Fn(bool) -> bool, baseline: impl FnOnce() -> Option<Arc<Buf>>,
 ) -> Option<Audio> {
     use crate::originals;
     if !current() { return None; }
     if !originals::can_match(track) { return None; }
     let token = crate::resolver_login::credential()?;
-    let hit = originals::known_candidate(track, &token, current)?;
+    let hit = originals::known_candidate_with_retry(track, &token, current, || { let _ = found(false); })?;
     let proof = hit.proof_id()?;
-    if !current() || !found() { return None; }
+    let local = hit.has_local_review(proof, &token);
+    let fast = hit.has_fast_proof() || local;
+    let reviewed = |digest: &str| hit.reviewed(proof, digest) || hit.locally_reviewed(proof, digest, &token);
+    if !current() || !found(fast) { return None; }
+    let mut receive_baseline = Some(baseline);
+    let mut inspect = || {
+        let baseline = receive_baseline.take()?()?;
+        let digest = originals::complete_digest(&baseline, current)?;
+        if !hit.matches(proof, &digest) { return None; }
+        if fast && !reviewed(&digest) && !found(false) { return None; }
+        Some((baseline, digest))
+    };
+    // In a mixed row resolve trust against this rendition as soon as its bytes arrive.
+    // Pure operator/confirmed hits can fetch the alternative concurrently with the baseline.
+    let early = if local || (fast && hit.mixed_trust()) { Some(inspect()?) } else { None };
+    let needs_review = early.as_ref().map_or(!fast, |(_, digest)| !reviewed(digest));
     if !originals::same_proof_recording(track, proof, |ids| api.tracks(ids)) || !current() { return None; }
     let refresh = || originals::known_candidate(track, &token, current);
-    let media = originals::known_audio(&hit, proof, &token, current, refresh, |alternative| {
+    let (media, redeemed_ticket) = originals::known_audio(&hit, proof, &token, needs_review, current, refresh, |alternative| {
         let public = api.tracks(&[alternative.into()]).ok()?.into_iter()
             .any(|t| t.id == alternative && t.catalog_id() != track.catalog_id() && originals::can_match(&t));
         if !public || !current() { return None; }
         load_media(api, alternative).ok()
     })?;
-    let digest = originals::complete_digest(&baseline()?, current)?;
-    if !hit.matches(proof, &digest) { return None; }
+    let (baseline, digest) = early.or_else(inspect)?;
+    if !reviewed(&digest) {
+        // Transport and a commitment identify the bytes. Only a current positive
+        // acoustic result can authorize reuse of an automatic mapping.
+        let lyrics = verification_lyrics(api.reference_lyrics(track), || {
+            if !current() { return Err("проверка отменена".into()); }
+            api.lyrics_until(&track.id, Some(Instant::now() + Duration::from_secs(3)))
+        }).ok()??;
+        let recording = |buf| crate::verification::Recording::decode(open_decoder(buf).ok()?, track.duration_ms);
+        let reference = recording(&baseline)?;
+        let alternative = recording(&media.buf)?;
+        let speech = originals::known_speech(&hit,&media,&redeemed_ticket);
+        let outcome = alternative.with_speech(speech, || originals::verification_outcome(api, &reference, &alternative, &lyrics, current))?;
+        if current() { hit.remember_local_review(proof, &digest, &token); }
+        if outcome.publishable && current() { originals::remember_known_review(&hit, proof, &digest, &redeemed_ticket, &token); }
+    }
     let decoder = open_decoder(&media.buf).ok()?;
     if !current() { return None; }
     let audio = (media.buf.clone(), decoder, media.format.clone());
@@ -623,7 +654,9 @@ fn load_for_playback(
         thread::spawn(move || {
             let current = || job.strong_count() != 0 && replacements_enabled()
                 && crate::resolver_login::session_revision() == revision;
-            let found = || result.send(KnownEvent::Found).is_ok();
+            let found = |fast| {
+                result.send(if fast { KnownEvent::Found } else { KnownEvent::Reviewing }).is_ok()
+            };
             if let Some(audio) = verified_known(&catalog, &requested, &current, found, || baseline.recv().ok()) {
                 let _ = result.send(KnownEvent::Verified(audio));
             }
@@ -641,9 +674,20 @@ fn load_for_playback(
     deliver(Ok(LoadedTrack { baseline, known: status }));
     if pending {
         let audio = known.into_iter().find_map(|event| match event {
-            KnownEvent::Verified(audio) => Some(audio), KnownEvent::Found => None,
+            KnownEvent::Verified(audio) => Some(audio), KnownEvent::Found | KnownEvent::Reviewing => None,
         });
         let _ = tx.send(Msg::KnownFinished { owner, revision, audio });
+    }
+}
+
+fn verification_lyrics(
+    album: Res<Option<crate::api::Lyrics>>, catalog: impl FnOnce() -> Res<crate::api::Lyrics>,
+) -> Res<Option<crate::api::Lyrics>> {
+    if matches!(album, Ok(Some(_))) { return album; }
+    match catalog() {
+        Ok(lyrics) if !lyrics.synced.is_empty() || !lyrics.text.is_empty() => Ok(Some(lyrics)),
+        Ok(_) => album,
+        Err(error) => Err(error),
     }
 }
 
@@ -656,34 +700,78 @@ fn resolve_track(
     let lyrics = std::cell::OnceCell::new();
     let reference_text = || lyrics.get_or_init(|| {
         if !current() { return Ok(None); }
-        let result = api.reference_lyrics(t);
-        if let Ok(Some(_)) = &result { return result; }
-        if t.lyrics {
-            let deadline = Instant::now() + Duration::from_secs(3);
-            match api.lyrics_until(&t.id, Some(deadline)) {
-                Ok(found) if !found.text.is_empty() || !found.synced.is_empty() => return Ok(Some(found)),
-                Err(e) => return Err(e),
-                _ => {}
-            }
-        }
-        result
+        verification_lyrics(api.reference_lyrics(t), || {
+            if !current() { return Err("проверка отменена".into()); }
+            // Some public recordings have lyrics even when the catalog flag is absent.
+            api.lyrics_until(&t.id, Some(Instant::now() + Duration::from_secs(3)))
+        })
     }).as_ref().map_err(|e| { retry.set(true); e.clone() });
-    let eligible = current() && replacements_enabled() && originals::should_uncensor(api, t,
-        || {
-            if !t.version.is_empty() && current() {
-                match api.reference_language(t) {
-                    Ok(Some(russian)) => return Ok(Some(russian)),
-                    Err(error) if !t.lyrics => { retry.set(true); return Err(error); }
-                    _ => {}
+    if current() && replacements_enabled() && originals::can_match(t) {
+        let foreground = verification.is_none_or(|v| v.lane.foreground.load(std::sync::atomic::Ordering::Acquire));
+        log(format!("Замена {}: подбор", t.id));
+        enum Metadata {
+            Catalog(Vec<String>),
+            External(Res<Vec<originals::OnlineCandidate>>),
+        }
+        // Search both catalogues concurrently; edition metadata ranks candidates only.
+        // Rapid skips can leave a request in flight, so serialize each provider separately.
+        static CATALOG_SLOT: Mutex<()> = Mutex::new(());
+        static EXTERNAL_SLOT: Mutex<()> = Mutex::new(());
+        let (send, recv) = mpsc::channel();
+        let search_owner = Arc::new(());
+        for external in [false, true] {
+            let (api, track, tx, active, owner) = (api.clone(), t.clone(), send.clone(), current.clone(), Arc::downgrade(&search_owner));
+            thread::spawn(move || {
+                let slot = if external { &EXTERNAL_SLOT } else { &CATALOG_SLOT };
+                loop {
+                    if owner.strong_count() == 0 || !active() { return; }
+                    if let Ok(_permit) = slot.try_lock() {
+                        let page = if external { Metadata::External(originals::online_candidates(&track)) }
+                                   else { Metadata::Catalog(originals::catalog_versions(&api, &track)) };
+                        let _ = tx.send(page);
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+            });
+        }
+        drop(send);
+        let mut candidates = Vec::new();
+        let mut catalog = Vec::new();
+        for result in recv {
+            if !current() { return None; }
+            match result {
+                Metadata::Catalog(rows) => catalog.extend(rows),
+                Metadata::External(page) => {
+                    candidates = page.inspect_err(|error| {
+                        retry.set(true);
+                        log(format!("Замена {}: ошибка поиска: {error}", t.id));
+                    }).unwrap_or_default();
                 }
             }
-            reference_text().map(|l| l.as_ref().and_then(crate::language::lyrics_language))
-        },
-        || crate::language::vocal_language(open_decoder(&buf).ok()?, t.duration_ms));
-    if eligible {
-        log(format!("Замена {}: подбор", t.id));
+        }
+        // Explicit labels describe catalog entries, not audible restoration.
+        // Every new recording, including labelled editions, must pass the same check.
+        if !originals::should_uncensor(api, t,
+            || {
+                if !t.version.is_empty() {
+                    if let Ok(Some(russian)) = api.reference_language(t) { return Ok(Some(russian)); }
+                }
+                reference_text().map(|l| l.as_ref().and_then(crate::language::lyrics_language))
+            },
+            || crate::language::vocal_language(open_decoder(&buf).ok()?, t.duration_ms)) {
+            log(format!("Замена {}: подбор пропущен: русский язык записи не подтверждён", t.id));
+            return None;
+        }
+        let lyrics = match reference_text() {
+            Ok(Some(reference)) if !matches!(reference.omission_plan, crate::api::OmissionPlan::Incomplete) => reference,
+            Ok(_) => { log(format!("Замена {}: нет текста для проверки, оставлен исходник", t.id)); return None; }
+            Err(_) => { log(format!("Замена {}: не удалось получить текст для проверки", t.id)); return None; }
+        };
+        if !current() { return None; }
         let baseline = std::cell::OnceCell::new();
-        let check = |candidate: Audio| -> Option<Audio> {
+        let publishable = std::cell::Cell::new(false);
+        let check = |candidate: Audio, speech| -> Option<Audio> {
             if !current() { return None; }
             let _permit = match verification {
                 Some(context) => Some(context.lane.enter(current)?),
@@ -692,63 +780,99 @@ fn resolve_track(
             let reference = baseline.get_or_init(|| Recording::decode(open_decoder(&buf).ok()?, t.duration_ms)).as_ref().or_else(|| { log("Замена: исходное аудио не декодировано"); None })?;
             let alternative = Recording::decode(open_decoder(&candidate.0).ok()?, t.duration_ms)
                 .or_else(|| { log("Замена: не удалось прочитать альтернативную запись"); None })?;
-            if reference.digest == alternative.digest { return None; }
-            let lyrics = reference_text().ok()?.as_ref().or_else(|| { log("Замена: отсутствует текст для проверки"); None })?;
+            if reference.digest == alternative.digest {
+                log(format!("Замена {}: аудио совпало с исходником", t.id));
+                return None;
+            }
             if !current() { return None; }
-            let time = originals::verified(api, reference, &alternative, lyrics)
-                .or_else(|| { log("Замена: изменения вокала не подтверждены"); None })?;
-            log(format!("Подтверждена замена {} на {:.1} с", t.id, time));
+            let outcome = alternative.with_speech(speech, || {
+                let outcome = originals::verification_outcome(api, reference, &alternative, lyrics, current);
+                if outcome.is_none() && crate::verification::remote_speech::retryable_failure() && current() {
+                    retry.set(true);
+                    log(format!("Замена {}: распознавание временно недоступно, разрешён повтор", t.id));
+                }
+                outcome
+            }).or_else(|| { log(format!("Замена {}: восстановленное слово не подтверждено", t.id)); None })?;
+            publishable.set(outcome.publishable);
+            log(format!("Подтверждена замена {} на {:.1} с", t.id, outcome.restored_at));
             Some(candidate)
         };
         let mut seen = std::collections::HashSet::new();
         let mut try_yandex = |id: &str| {
             if !current() || !seen.insert(id.to_owned()) { return None; }
             let (buf, decoder, format) = load_audio(api, id).ok()?;
-            check((buf, decoder, format))
+            check((buf, decoder, format), None)
         };
-        for id in originals::catalog_versions(api, t) {
+        for id in catalog {
             if let Some(audio) = try_yandex(&id) {
-                if current() { originals::remember_catalog(t, id, buf.clone(), audio.0.clone(), revision); }
+                if current() { originals::remember_catalog(t, id, buf.clone(), audio.0.clone(), revision, publishable.get()); }
                 return Some(audio);
             }
         }
         if !current() { return None; }
-        let candidates = originals::online_candidates(t).inspect_err(|_| { retry.set(true); log("Замена: внешний поиск недоступен"); }).unwrap_or_default();
         log(format!("Замена {}: внешних кандидатов {}", t.id, candidates.len()));
-        let next = candidates.first().and_then(|candidate| candidate.next.clone());
+        let page = |items: Vec<originals::OnlineCandidate>| {
+            let cursor = items.first().and_then(|item| Some(candidate_downloads::Cursor {
+                ticket: item.next.clone()?, after_rejection: item.next_after_rejection,
+            }));
+            (items, cursor)
+        };
         // Start network I/O even if the original catalog stream is still arriving.
         // Local cache reuse needs a complete baseline and fresh proofs always bind both files.
         let original_hash = if buf.done() { originals::complete_digest(&buf, current) } else { None };
         let cache_hash = original_hash.clone();
         let requested = t.clone();
+        let next_track_id = t.id.clone();
+        let prepare_reference = foreground && candidates.iter().any(originals::OnlineCandidate::needs_first_download);
         let fetch_limit = verification
             .filter(|context| !context.lane.foreground.load(std::sync::atomic::Ordering::Acquire))
             .map(|context| (context.lane.gate.speculative_download.clone(), context.lane.clone()));
         return candidate_downloads::first_verified(
-            candidates, next, current.clone(),
-            |ticket| {
-                let items = originals::online_next(ticket)?;
-                let next = items.first().and_then(|item| item.next.clone());
-                Ok((items, next))
+            page(candidates), |candidate| !candidate.needs_first_download(), current.clone(),
+            move |ticket| {
+                let started = Instant::now();
+                let result = originals::online_next(ticket);
+                let outcome = result.as_ref().map(|rows| format!("кандидатов {}", rows.len()))
+                    .unwrap_or_else(|_| "ошибка".into());
+                log(format!("Замена {}: следующий поиск — {outcome}, {} мс", next_track_id, started.elapsed().as_millis()));
+                result.map(page)
             },
             move |candidate, active| {
                 let _slot = if let Some((limit, lane)) = &fetch_limit {
                     speculative_download_slot(limit, lane, &active).map_err(|_| "cancelled".to_owned())?
                 } else { None };
-                originals::online_audio(candidate, &requested, cache_hash.as_deref(), &active)
+                let started = Instant::now();
+                let result = originals::online_audio(candidate, &requested, cache_hash.as_deref(), &active);
+                if result.is_err() {
+                    log(format!("Замена {}: доставка аудио не удалась, {} мс", requested.id, started.elapsed().as_millis()));
+                }
+                result
+            },
+            |waiting| {
+                if !prepare_reference || !buf.done() || !waiting() { return; }
+                let _permit = match verification {
+                    Some(context) => match context.lane.enter(waiting) {
+                        Some(permit) => Some(permit),
+                        None => return,
+                    },
+                    None => None,
+                };
+                if !waiting() { return; }
+                // Preparation during transfer ends at PCM decoding. The word to
+                // review can only be selected once both waveforms are available.
+                baseline.get_or_init(|| Recording::decode(open_decoder(&buf).ok()?, t.duration_ms));
             },
             |incoming| {
-                let (candidate, result) = incoming.inspect_err(|_| {
-                    retry.set(true);
-                    log("Замена: не удалось получить кандидата");
-                }).ok()?;
+                let (candidate, result) = incoming.inspect_err(|_| retry.set(true)).ok()?;
                 let decoder = open_decoder(&result.buf).ok()?;
                 let audio = (result.buf.clone(), decoder, result.format.clone());
-                let audio = if result.cached { audio } else { check(audio)? };
+                // A 304 validates cached media bytes. The same acoustic policy applies to both delivery paths.
+                let speech = originals::candidate_speech(&candidate,&result);
+                let audio = check(audio,speech)?;
                 if !current() { return None; }
                 let proof = original_hash.clone().or_else(|| originals::complete_digest(&buf, current))?;
                 if !current() { return None; }
-                originals::remember_external(result, &candidate, t.catalog_id(), Some(&proof));
+                originals::remember_external(result, &candidate, t.catalog_id(), Some(&proof), publishable.get());
                 Some(audio)
             },
         );
@@ -2496,7 +2620,7 @@ impl Engine {
                 let tx = self.tx.clone();
                 thread::spawn(move || {
                     let current = || job.strong_count() > 0 && replacements_enabled() && crate::resolver_login::session_revision() == revision;
-                    let audio = verified_known(&api, &track, &current, || true, || Some(baseline));
+                    let audio = verified_known(&api, &track, &current, |_| true, || Some(baseline));
                     let _ = tx.send(Msg::KnownFinished { owner: job, revision, audio });
                 });
                 return;
@@ -2746,6 +2870,16 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn catalog_lyrics_remain_available_when_album_lookup_fails() {
+        let catalog = || Ok(crate::api::Lyrics { text: vec!["проверка".into()], ..Default::default() });
+        assert!(verification_lyrics(Err("503".into()), catalog).unwrap().is_some());
+        assert!(verification_lyrics(Ok(None), catalog).unwrap().is_some());
+        assert!(verification_lyrics(Err("timeout".into()), || Ok(Default::default())).is_err());
+        assert!(verification_lyrics(Ok(None), || Ok(Default::default())).unwrap().is_none());
+        assert!(verification_lyrics(Ok(Some(catalog().unwrap())), || panic!("already available")).unwrap().is_some());
+    }
+
+    #[test]
     fn seek_keeps_latest_position_until_audio_acknowledges_it() {
         let (tx, rx) = mpsc::channel();
         let mut e = Engine::new(tx.clone(), Default::default(), Default::default(), Arc::new(|| {}), Default::default());
@@ -2856,6 +2990,22 @@ mod tests {
     }
 
     #[test]
+    fn explicit_catalog_label_does_not_mark_unchecked_audio_uncensored() {
+        let _guard = super::EXPLICIT_TEST_LOCK.lock().unwrap();
+        let revision = crate::resolver_login::session_revision();
+        for label in ["Explicit", "Uncensored", "Clean"] {
+            let track = crate::api::parse_track(&serde_json::json!({"id":7, "title":"Track",
+                "version":label, "explicit":true})).unwrap();
+            let mut engine = Engine::new(mpsc::channel().0, Default::default(), Default::default(), Arc::new(|| {}), Default::default());
+            engine.current = Some(track);
+            engine.current_load = Some(Arc::new(()));
+            engine.paused = true;
+            engine.play_loaded(LoadedTrack { baseline:make_audio("MP3"), known:KnownStatus::Miss(revision) });
+            assert_eq!(engine.sh().audio_version, AudioVersion::Unknown, "{label}");
+        }
+    }
+
+    #[test]
     fn first_decoder_uses_verified_audio_and_keeps_catalog_after_session_change() {
         let _guard = super::EXPLICIT_TEST_LOCK.lock().unwrap();
         let track = crate::api::parse_track(&serde_json::json!({"id":7, "title":"Track"})).unwrap();
@@ -2898,6 +3048,31 @@ mod tests {
         assert_eq!(engine.resume_at.as_ref().map(|p| p.1), Some(12.0));
         engine.stop_audio();
         assert!(engine.paused_start.is_none());
+    }
+
+    #[test]
+    fn stale_acoustic_proof_releases_first_buffer_while_verifier_is_running() {
+        let _guard = super::EXPLICIT_TEST_LOCK.lock().unwrap();
+        let track = crate::api::parse_track(&serde_json::json!({"id":7,"title":"Track"})).unwrap();
+        let revision = crate::resolver_login::session_revision();
+        let mut engine = Engine::new(mpsc::channel().0, Default::default(), Default::default(), Arc::new(|| {}), Default::default());
+        engine.current = Some(track.clone());
+        engine.current_load = Some(Arc::new(()));
+        let (events, pending) = mpsc::channel();
+        events.send(KnownEvent::Found).unwrap();
+        events.send(KnownEvent::Reviewing).unwrap();
+        let baseline = make_audio("baseline");
+        let start = std::time::Instant::now();
+        let known = initial_status(&pending, revision, FIRST_BUFFER_WAIT);
+        assert!(matches!(known, KnownStatus::Pending(_)));
+        let (first, source) = engine.initial_audio(&track, LoadedTrack { baseline, known });
+        let elapsed = start.elapsed();
+        assert_eq!(source.name(), "catalog");
+        assert_eq!(first.2, "baseline");
+        assert!(elapsed < Duration::from_secs(1));
+        eprintln!("first_decoder=catalog after_reviewing={elapsed:?}");
+        events.send(KnownEvent::Verified(make_audio("later"))).unwrap();
+        assert!(matches!(pending.recv(), Ok(KnownEvent::Verified(_))));
     }
 
     #[test]

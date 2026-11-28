@@ -51,11 +51,31 @@ fn recording(title: &str, artists: impl Iterator<Item = String>) -> Option<(Stri
     (!title.is_empty() && !artists.is_empty()).then_some((title, artists))
 }
 
-pub fn verified(api: &Api, original: &crate::verification::Recording, candidate: &crate::verification::Recording, lyrics: &crate::api::Lyrics) -> Option<f32> {
-    if lyrics.synced.is_empty() && lyrics.text.is_empty() { return None; }
+const ACOUSTIC_POLICY: u8 = 3;
+// Local cache revision changes when the verifier becomes stricter, independently of the wire policy.
+const LOCAL_VERIFIER_REVISION: u8 = 5;
+
+// Version 2 receipts already bind a restored-word check to the same byte pair.
+// Newly sampled checks must only complete a version 3 lease.
+fn supported_receipt(version: Option<u8>) -> bool {
+    matches!(version, Some(2) | Some(ACOUSTIC_POLICY))
+}
+
+fn cacheable_verification(result: Option<f32>) -> Res<Option<f32>> {
+    if result.is_none() && crate::verification::remote_speech::incomplete() {
+        return Err("Проверка аудио не завершена".into());
+    }
+    Ok(result)
+}
+
+pub fn verified(api: &Api, original: &crate::verification::Recording, candidate: &crate::verification::Recording, lyrics: &crate::api::Lyrics, current: &impl Fn() -> bool) -> Option<f32> {
+    if !current() || matches!(lyrics.omission_plan, crate::api::OmissionPlan::Incomplete)
+        || (lyrics.synced.is_empty() && lyrics.text.is_empty()) { return None; }
     // A positive proof is specific to both decoded recordings, their order and the lyrics used.
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
+    hash.update(b"ym-acoustic-proof\0");
+    hash.update([ACOUSTIC_POLICY, LOCAL_VERIFIER_REVISION]);
     hash.update(original.digest);
     hash.update(candidate.digest);
     for line in &lyrics.synced {
@@ -70,10 +90,15 @@ pub fn verified(api: &Api, original: &crate::verification::Recording, candidate:
             hash.update(line.as_bytes());
         }
     }
+    if let crate::api::OmissionPlan::Complete(checks) = &lyrics.omission_plan {
+        // Include the complete plan as well as the acoustic policy in both cache keys.
+        hash.update(b"\0ym-omission-review-v1\0");
+        hash.update(serde_json::to_vec(checks).ok()?);
+    }
     let key = format!("{:x}", hash.finalize());
     api.originals.verified.find(&key, || {
         // One record per bucket bounds the disk cache even for a long-lived installation.
-        let dir = crate::config::cache_dir().join("restored-speech-v1");
+        let dir = crate::config::cache_dir().join(format!("restored-speech-v{ACOUSTIC_POLICY}-r{LOCAL_VERIFIER_REVISION}"));
         let path = dir.join(&key[..2]);
         if let Ok(bytes) = std::fs::read(&path) {
             if let Ok((saved, time)) = serde_json::from_slice::<(String, f32)>(&bytes) {
@@ -82,7 +107,8 @@ pub fn verified(api: &Api, original: &crate::verification::Recording, candidate:
                 }
             }
         }
-        let time = crate::verification::compare(original, candidate, lyrics);
+        let time = crate::verification::compare_while_current(original, candidate, lyrics, current);
+        if !current() { return Err("Выбор трека изменился".into()); }
         if let Some(time) = time {
             let temp = path.with_extension(format!("{}.tmp", std::process::id()));
             if std::fs::create_dir_all(&dir).is_ok() &&
@@ -91,8 +117,35 @@ pub fn verified(api: &Api, original: &crate::verification::Recording, candidate:
                 let _ = std::fs::remove_file(&temp);
             }
         }
-        Ok(time)
+        cacheable_verification(time)
     })
+}
+
+/// A locally accepted edit is not automatically safe to publish to all users.
+/// `verified` returns only the restoration position, so publication is limited to
+/// a complete one-target omission plan whose sole target passed that verifier.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VerificationOutcome {
+    pub restored_at: f32,
+    pub publishable: bool,
+}
+
+fn publishable_evidence(lyrics: &crate::api::Lyrics, restored_at: f32) -> bool {
+    if !restored_at.is_finite() || restored_at <= 0.0 { return false; }
+    let restored_ms = (restored_at * 1000.0).round();
+    matches!(&lyrics.omission_plan, crate::api::OmissionPlan::Complete(checks)
+        if checks.as_slice().first().is_some_and(|check| checks.len() == 1
+            && check.missing.split_whitespace().count() == 1
+            && restored_ms >= check.from_ms as f32 && restored_ms <= check.to_ms as f32))
+}
+
+pub fn verification_outcome(
+    api: &Api, original: &crate::verification::Recording, candidate: &crate::verification::Recording,
+    lyrics: &crate::api::Lyrics, current: &impl Fn() -> bool,
+) -> Option<VerificationOutcome> {
+    let restored_at = verified(api, original, candidate, lyrics, current)?;
+    let publishable = publishable_evidence(lyrics, restored_at);
+    Some(VerificationOutcome { restored_at, publishable })
 }
 
 pub fn can_match(track: &Track) -> bool {
@@ -144,49 +197,61 @@ fn title_variant(title: &str) -> (&str, Option<bool>) {
     (title, None)
 }
 
+fn already_credited_feature(track: &Track, version: &str) -> bool {
+    let credit = version.strip_prefix("feat.").or_else(|| version.strip_prefix("featuring "));
+    credit.is_some_and(|credit| {
+        let name = credit.trim().replace('ё', "е");
+        !name.is_empty() && track.artist_list.iter().any(|a| normalized(&a.name).replace('ё', "е") == name)
+    })
+}
+
 fn recording_version(track: &Track) -> (String, Option<bool>) {
     let version = normalized(&track.version);
     if let Some(explicit) = variant(&version) { return (String::new(), Some(explicit)); }
-    let credit = version.strip_prefix("feat.").or_else(|| version.strip_prefix("featuring "));
-    if let Some(credit) = credit {
-        let name = credit.trim().replace('ё', "е");
-        if !name.is_empty() && track.artist_list.iter().any(|a| normalized(&a.name).replace('ё', "е") == name) {
-            return (String::new(), None);
-        }
-    }
+    if already_credited_feature(track, &version) { return (String::new(), None); }
     (version, None)
 }
 
-fn catalog_candidates<'a>(track: &Track, candidates: &'a [Track]) -> Vec<&'a str> {
+fn catalog_version(track: &Track) -> (String, Option<bool>) {
+    let (version, marker) = recording_version(track);
+    // Yandex can list a guest after the edition, e.g. "Remix; feat. Guest".
+    // Remove only a complete credit already present in the artist list. Keep
+    // edition words and unknown credits; the complete artist IDs must also match.
+    let version = version.split(';').map(str::trim)
+        .filter(|part| !already_credited_feature(track, part)).collect::<Vec<_>>().join("; ");
+    (version, marker)
+}
+
+fn catalog_candidates(track: &Track, candidates: &[Track]) -> Vec<String> {
     let title = normalized(&track.title);
-    let (title, source_marker) = title_variant(&title);
-    let (stable_version, version_marker) = recording_version(track);
-    let source_marker = version_marker.or(source_marker);
+    let (title, _) = title_variant(&title);
+    let (stable_version, _) = catalog_version(track);
     let Some(recording_key) = recording(title, track.artist_list.iter().map(|a| a.id.clone())) else { return vec![] };
-    let hits = candidates.iter().filter(|candidate| {
+    let hits = candidates.iter().filter_map(|candidate| {
         if candidate.catalog_id() == track.catalog_id() || !can_match(candidate)
             || track.duration_ms.abs_diff(candidate.duration_ms) > MATCH_TOLERANCE_MS
         {
-            return false;
+            return None;
         }
         let candidate_title = normalized(&candidate.title);
         let (candidate_title, marker) = title_variant(&candidate_title);
-        let (candidate_version, version_marker) = recording_version(candidate);
+        let (candidate_version, version_marker) = catalog_version(candidate);
         let marker = version_marker.or(marker);
         let explicit = marker == Some(true)
-            || (candidate.explicit && marker != Some(false) && (!track.explicit || source_marker == Some(false)));
-        explicit
+            || (candidate.explicit && marker != Some(false));
+        (explicit
             && stable_version == candidate_version
-            && recording(candidate_title, candidate.artist_list.iter().map(|a| a.id.clone())).as_ref() == Some(&recording_key)
+            && recording(candidate_title, candidate.artist_list.iter().map(|a| a.id.clone())).as_ref() == Some(&recording_key))
+            .then(|| candidate.catalog_id().to_owned())
     });
-    hits.map(|candidate| candidate.catalog_id()).collect()
+    hits.collect()
 }
 
 pub fn catalog_versions(api: &Api, track: &Track) -> Vec<String> {
     let Some(query) = recording_query(track) else { return vec![] };
     api.originals.catalog.find(&track.id, || {
         let candidates = api.search_recording(&query)?;
-        Ok(Some(catalog_candidates(track, &candidates).into_iter().map(String::from).collect()))
+        Ok(Some(catalog_candidates(track, &candidates)))
     }).unwrap_or_default()
 }
 
@@ -204,21 +269,27 @@ use crate::resolver_login;
 mod confirmed_audio;
 pub(crate) use confirmed_audio::digest as media_digest;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct OnlineCandidate {
     source: String,
     ticket: String,
     sha256: Option<String>,
     pub next: Option<String>,
+    #[serde(default)]
+    pub next_after_rejection: bool,
+    #[serde(default)]
+    speech: bool,
 }
 
 impl OnlineCandidate {
+    pub(crate) fn needs_first_download(&self) -> bool { self.sha256.is_none() }
+
     fn valid_ticket(&self) -> bool {
         self.ticket.len() == 32 && self.ticket.bytes().all(|b| b.is_ascii_hexdigit())
     }
 
     fn valid(&self) -> bool {
-        self.valid_ticket() && matches!(self.source.as_str(), "Bandcamp" | "SoundCloud" | "YouTube Music" | "Audius")
+        self.valid_ticket() && matches!(self.source.as_str(), "Bandcamp" | "SoundCloud" | "YouTube Music" | "Audius" | "Internet Archive")
     }
 }
 
@@ -244,7 +315,12 @@ pub fn public_metadata(track: &Track) -> Option<serde_json::Value> {
 fn post_metadata(path: &str, token: &str, body: &serde_json::Value, timeout: Duration) -> Res<reqwest::blocking::Response> {
     let body = serde_json::to_vec(body).map_err(|e| e.to_string())?;
     let request = resolver_login::signed("POST", path, token, body)?;
+    let request = if matches!(path, "/known" | "/confirm" | "/catalog/confirm" | "/known/review") {
+        request.header("X-YM-Acoustic-Review", ACOUSTIC_POLICY.to_string())
+    } else { request };
     let request = if path == "/search" { request.header("X-YM-Search-Pages", "1") } else { request };
+    let request = if matches!(path, "/search" | "/next") { request.header("X-YM-Editions", "1") } else { request };
+    let request = if matches!(path, "/search" | "/known") { request.header("X-YM-Netlabels", "1") } else { request };
     request.timeout(timeout).send().map_err(|e| e.to_string())
 }
 
@@ -254,10 +330,23 @@ fn read_json<T: serde::de::DeserializeOwned>(response: reqwest::blocking::Respon
     serde_json::from_reader(response.take(16 * 1024)).map_err(|e| e.to_string())
 }
 
+fn candidate_page(path: &str, mut post: impl FnMut() -> Res<reqwest::blocking::Response>) -> Res<Vec<OnlineCandidate>> {
+    let started = Instant::now();
+    let mut response = post()?;
+    // A fast transient failure keeps the original owner-bound cursor. Re-sign
+    // once with a new nonce, but do not double a slow upstream timeout. Denial
+    // and ambiguous transport loss are never retried here.
+    if path == "/next" && response.status().as_u16() == 503 && started.elapsed() < Duration::from_secs(1) {
+        drop(response);
+        response = post()?;
+    }
+    let hits: Vec<OnlineCandidate> = read_json(response)?;
+    Ok(hits.into_iter().filter(OnlineCandidate::valid).take(12).collect())
+}
+
 fn candidates(path: &str, metadata: serde_json::Value) -> Res<Vec<OnlineCandidate>> {
     let Some(token) = resolver_login::credential() else { return Ok(vec![]) };
-    let hits: Vec<OnlineCandidate> = read_json(post_metadata(path, &token, &metadata, Duration::from_secs(24))?)?;
-    Ok(hits.into_iter().filter(OnlineCandidate::valid).take(12).collect())
+    candidate_page(path, || post_metadata(path, &token, &metadata, Duration::from_secs(24)))
 }
 
 pub fn online_candidates(track: &Track) -> Res<Vec<OnlineCandidate>> {
@@ -282,6 +371,10 @@ pub struct KnownCandidate {
     pair_sha256s: Vec<String>,
     #[serde(default)]
     baseline_sha256s: Vec<String>,
+    #[serde(default)]
+    acoustic_pair_sha256s: Vec<String>,
+    #[serde(default)]
+    acoustic_review_version: Option<u8>,
 }
 
 fn read_proof_id<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<String>, D::Error> {
@@ -309,11 +402,56 @@ impl KnownCandidate {
         if self.pair_sha256s.len() > 8 || self.pair_sha256s.iter().enumerate().any(|(i, pair)|
             !digest_valid(pair) || pair == media || Some(pair) == self.pair_sha256.as_ref() || self.pair_sha256s[..i].contains(pair)
         ) { return None; }
+        if !supported_receipt(self.acoustic_review_version) && !self.acoustic_pair_sha256s.is_empty() { return None; }
+        if self.acoustic_pair_sha256s.len() > 9 || self.acoustic_pair_sha256s.iter().enumerate().any(|(i, pair)|
+            !digest_valid(pair) || pair == media || self.acoustic_pair_sha256s[..i].contains(pair)
+                || !(Some(pair) == self.pair_sha256.as_ref() || self.pair_sha256s.contains(pair)
+                    || self.baseline_sha256.iter().chain(&self.baseline_sha256s).any(|s| pair_digest(track, s, media) == *pair))
+        ) { return None; }
         match (&self.baseline_sha256, &self.pair_sha256) {
             (Some(baseline), None) if digest_valid(baseline) && baseline != media => Some(pair_digest(track, baseline, media)),
             (None, Some(pair)) if digest_valid(pair) && self.baseline_sha256s.is_empty() => Some(pair.clone()),
             _ => None,
         }
+    }
+
+    pub fn has_fast_proof(&self) -> bool {
+        self.baseline_sha256.is_some() || !self.acoustic_pair_sha256s.is_empty()
+    }
+
+    pub fn has_local_review(&self, track: &str, token: &str) -> bool {
+        self.cache_key(track).into_iter().chain(self.pair_sha256s.iter().cloned())
+            .any(|pair| read_local_review(&local_review_path(token, &pair), &pair))
+    }
+
+    pub fn locally_reviewed(&self, track: &str, baseline: &str, token: &str) -> bool {
+        if !self.matches(track, baseline) { return false; }
+        let pair = pair_digest(track, baseline, self.candidate.sha256.as_deref().unwrap());
+        read_local_review(&local_review_path(token, &pair), &pair)
+    }
+
+    pub fn remember_local_review(&self, track: &str, baseline: &str, token: &str) {
+        if self.proof_id() != Some(track) || !self.matches(track, baseline) { return; }
+        let pair = pair_digest(track, baseline, self.candidate.sha256.as_deref().unwrap());
+        let _ = write_local_review(&local_review_path(token, &pair), &pair);
+    }
+
+    pub fn mixed_trust(&self) -> bool {
+        self.pair_sha256.iter().chain(&self.pair_sha256s).any(|pair| !self.acoustic_pair_sha256s.contains(pair))
+    }
+
+    pub fn reviewed(&self, track: &str, baseline: &str) -> bool {
+        self.baseline_sha256.as_deref() == Some(baseline) || self.baseline_sha256s.iter().any(|s| s == baseline)
+            || (supported_receipt(self.acoustic_review_version) && self.candidate.sha256.as_deref().is_some_and(|media|
+                self.acoustic_pair_sha256s.contains(&pair_digest(track, baseline, media))))
+    }
+
+    fn review_report(&self, track: &str, baseline: &str, redeemed_ticket: &str) -> Option<serde_json::Value> {
+        if self.acoustic_review_version != Some(ACOUSTIC_POLICY) || self.proof_id() != Some(track) || !self.matches(track, baseline)
+            || self.reviewed(track, baseline) || redeemed_ticket.len() != 32
+            || !redeemed_ticket.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
+        let pair = pair_digest(track, baseline, self.candidate.sha256.as_deref()?);
+        Some(serde_json::json!({"ticket":redeemed_ticket,"pair_sha256":pair,"review_version":ACOUSTIC_POLICY}))
     }
 
     pub fn matches(&self, track: &str, baseline: &str) -> bool {
@@ -325,6 +463,42 @@ impl KnownCandidate {
         let expected = pair_digest(track, baseline, media);
         self.pair_sha256.as_ref() == Some(&expected) || self.pair_sha256s.contains(&expected)
     }
+}
+
+// Local acoustic decisions never authorize another account or bypass a fresh
+// service lookup. The versioned, bounded cache names both exact encoded files.
+fn local_review_path(token: &str, pair: &str) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let owner = format!("{:x}", Sha256::digest(token.as_bytes()));
+    crate::config::cache_dir().join(format!("reviewed-pairs-v{ACOUSTIC_POLICY}-r{LOCAL_VERIFIER_REVISION}")).join(owner).join(&pair[..2])
+}
+
+fn read_local_review(path: &std::path::Path, pair: &str) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else { return false };
+    if metadata.len() != 64 || metadata.modified().ok().and_then(|t| t.elapsed().ok())
+        .is_none_or(|age| age > Duration::from_secs(7 * 86400)) { return false; }
+    std::fs::read(path).is_ok_and(|bytes| bytes == pair.as_bytes())
+}
+
+fn write_local_review(path: &std::path::Path, pair: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().ok_or_else(|| std::io::Error::other("review cache path"))?;
+    std::fs::create_dir_all(parent)?;
+    let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), NEXT.fetch_add(1,Ordering::Relaxed)));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp)?;
+    let result = file.write_all(pair.as_bytes());
+    drop(file);
+    let result = result.and_then(|_| std::fs::rename(&temp, path));
+    if result.is_err() { let _ = std::fs::remove_file(temp); }
+    result
 }
 
 /// Only the current public catalog can establish that different queue and receipt IDs
@@ -339,44 +513,140 @@ pub fn same_proof_recording(track: &Track, proof: &str, get: impl FnOnce(&[Strin
         && (track.catalog_id() == track.id || track.catalog_id() == playing.catalog_id())
 }
 
-fn lookup_known(canonical: &str, original: &str, mut metadata: serde_json::Value, mut post: impl FnMut(&serde_json::Value) -> Res<reqwest::blocking::Response>) -> Option<KnownCandidate> {
+enum KnownLookup {
+    Hit(Box<KnownCandidate>),
+    Miss,
+    Rejected,
+    Retryable,
+}
+
+impl KnownLookup {
+    fn retryable(&self) -> bool { matches!(self, Self::Retryable) }
+    fn into_hit(self) -> Option<KnownCandidate> {
+        match self { Self::Hit(hit) => Some(*hit), _ => None }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum KnownPostError { Retryable, Terminal }
+
+impl KnownPostError {
+    fn lookup(self) -> KnownLookup {
+        match self { Self::Retryable => KnownLookup::Retryable, Self::Terminal => KnownLookup::Miss }
+    }
+}
+
+fn transient_io_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(kind, std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::TimedOut)
+}
+
+fn error_chain_has_transient_io(mut error: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            if transient_io_kind(io.kind()) { return true; }
+        }
+        let Some(source) = error.source() else { return false; };
+        error = source;
+    }
+}
+
+fn reqwest_is_transient(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error_chain_has_transient_io(error)
+}
+
+fn post_known_metadata(token: &str, body: &serde_json::Value) -> Result<reqwest::blocking::Response, KnownPostError> {
+    let body = serde_json::to_vec(body).map_err(|_| KnownPostError::Terminal)?;
+    let request = resolver_login::signed("POST", "/known", token, body).map_err(|_| KnownPostError::Terminal)?;
+    request.header("X-YM-Acoustic-Review", ACOUSTIC_POLICY.to_string())
+        .header("X-YM-Netlabels", "1")
+        .timeout(Duration::from_secs(4)).send()
+        .map_err(|error| if reqwest_is_transient(&error) { KnownPostError::Retryable } else { KnownPostError::Terminal })
+}
+
+fn read_known_hits(response: reqwest::blocking::Response) -> Result<Vec<KnownCandidate>, KnownLookup> {
+    if response.status() != reqwest::StatusCode::OK { return Err(known_response(&response)); }
+    use std::io::Read;
+    let mut bytes = Vec::with_capacity(4096);
+    if let Err(error) = response.take(16 * 1024).read_to_end(&mut bytes) {
+        return Err(if error_chain_has_transient_io(&error) { KnownLookup::Retryable } else { KnownLookup::Miss });
+    }
+    serde_json::from_slice(&bytes).map_err(|_| KnownLookup::Miss)
+}
+
+fn retry_known_once(mut lookup: impl FnMut() -> KnownLookup, current: impl Fn() -> bool, on_retry: impl FnOnce(), mut wait: impl FnMut()) -> KnownLookup {
+    let mut result = lookup();
+    if result.retryable() && current() {
+        // Bounded and cancellable; this is called only by the background known lookup.
+        on_retry();
+        for _ in 0..10 {
+            if !current() { return KnownLookup::Miss; }
+            wait();
+        }
+        if !current() { return KnownLookup::Miss; }
+        result = lookup();
+    }
+    result
+}
+
+fn known_response(response: &reqwest::blocking::Response) -> KnownLookup {
+    match response.status().as_u16() {
+        502..=504 => KnownLookup::Retryable,
+        401 | 403 => KnownLookup::Rejected,
+        _ => KnownLookup::Miss,
+    }
+}
+
+fn lookup_known_outcome(canonical: &str, original: &str, mut metadata: serde_json::Value, mut post: impl FnMut(&serde_json::Value) -> Result<reqwest::blocking::Response, KnownPostError>) -> KnownLookup {
     metadata["catalog_id"] = canonical.into();
     metadata["include_yandex"] = true.into();
     metadata["include_aliases"] = true.into();
-    let mut response = post(&metadata).ok()?;
+    let mut response = match post(&metadata) { Ok(response) => response, Err(error) => return error.lookup() };
     let aliases = response.status() != reqwest::StatusCode::BAD_REQUEST;
     if !aliases {
-        metadata.as_object_mut()?.remove("include_aliases");
-        response = post(&metadata).ok()?;
+        let Some(object) = metadata.as_object_mut() else { return KnownLookup::Miss };
+        object.remove("include_aliases");
+        response = match post(&metadata) { Ok(response) => response, Err(error) => return error.lookup() };
         if response.status() == reqwest::StatusCode::BAD_REQUEST {
-            metadata.as_object_mut()?.remove("include_yandex");
-            response = post(&metadata).ok()?;
+            metadata.as_object_mut().unwrap().remove("include_yandex");
+            response = match post(&metadata) { Ok(response) => response, Err(error) => return error.lookup() };
         }
     }
-    let read_hits = |response: reqwest::blocking::Response| {
-        if response.status() != reqwest::StatusCode::OK { return None; }
-        read_json::<Vec<KnownCandidate>>(response).ok()
-    };
-    let mut hits = read_hits(response)?;
+    let mut hits = match read_known_hits(response) { Ok(hits) => hits, Err(result) => return result };
     let mut requested = canonical;
     if !aliases && hits.is_empty() && original != canonical {
         // Older services indexed receipts only by the exact queue ID.
         requested = original;
         metadata["catalog_id"] = original.into();
-        hits = read_hits(post(&metadata).ok()?)?;
+        let response = match post(&metadata) { Ok(response) => response, Err(error) => return error.lookup() };
+        hits = match read_known_hits(response) { Ok(hits) => hits, Err(result) => return result };
     }
-    let [mut hit]: [KnownCandidate; 1] = hits.try_into().ok()?;
-    if (!aliases && hit.proof_catalog_id.is_some()) || (hit.is_yandex() && metadata.get("include_yandex").is_none()) { return None; }
-    if !hit.valid(requested) { return None; }
+    let [mut hit]: [KnownCandidate; 1] = match hits.try_into() { Ok(hit) => hit, Err(_) => return KnownLookup::Miss };
+    if (!aliases && hit.proof_catalog_id.is_some()) || (hit.is_yandex() && metadata.get("include_yandex").is_none()) { return KnownLookup::Miss; }
+    if !hit.valid(requested) { return KnownLookup::Miss; }
     hit.proof_catalog_id.get_or_insert_with(|| requested.to_owned());
-    Some(hit)
+    KnownLookup::Hit(Box::new(hit))
+}
+
+#[cfg(test)]
+fn lookup_known(canonical: &str, original: &str, metadata: serde_json::Value, post: impl FnMut(&serde_json::Value) -> Result<reqwest::blocking::Response, KnownPostError>) -> Option<KnownCandidate> {
+    lookup_known_outcome(canonical, original, metadata, post).into_hit()
 }
 
 pub fn known_candidate(track: &Track, token: &str, current: &impl Fn() -> bool) -> Option<KnownCandidate> {
-    lookup_known(track.catalog_id(), &track.id, public_metadata(track)?, |body| {
-        if !current() { return Err("Выбор трека изменился".into()); }
-        post_metadata("/known", token, body, Duration::from_secs(4))
-    })
+    known_candidate_with_retry(track, token, current, || {})
+}
+
+pub fn known_candidate_with_retry(track: &Track, token: &str, current: &impl Fn() -> bool, on_retry: impl FnOnce()) -> Option<KnownCandidate> {
+    let metadata = public_metadata(track)?;
+    let lookup = || lookup_known_outcome(track.catalog_id(), &track.id, metadata.clone(), |body| {
+        if !current() { return Err(KnownPostError::Terminal); }
+        post_known_metadata(token, body)
+    });
+    // This runs on the lookup worker; baseline playback does not wait on it.
+    // signed() creates a fresh timestamp and nonce for each actual HTTP attempt.
+    let result = retry_known_once(lookup, current, on_retry, || std::thread::sleep(Duration::from_millis(20)));
+    result.into_hit()
 }
 
 #[derive(Deserialize)]
@@ -442,7 +712,13 @@ fn fetch_audio(candidate: &OnlineCandidate, token: String, cached: Option<std::s
 
 fn ticket_audio(response: reqwest::blocking::Response, expected: Option<&str>, cached: Option<std::sync::Arc<crate::stream::Buf>>, current: &impl Fn() -> bool) -> Result<std::sync::Arc<crate::stream::Buf>, AudioError> {
     match response.status() {
-        reqwest::StatusCode::NOT_MODIFIED => cached.ok_or(AudioError::Rejected),
+        reqwest::StatusCode::NOT_MODIFIED => {
+            let hash = expected.filter(|hash| digest_valid(hash)).ok_or(AudioError::Rejected)?;
+            if response.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()) != Some(&format!(r#""{hash}""#)) {
+                return Err(AudioError::DigestMismatch);
+            }
+            cached.ok_or(AudioError::Rejected)
+        }
         reqwest::StatusCode::OK => {
             let buf = crate::stream::Buf::from_media(response, current).map_err(|e| match e.kind() {
                 std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionAborted => AudioError::Transport,
@@ -495,6 +771,7 @@ fn deliver_known<T>(
     if !current() || next.candidate.ticket == hit.candidate.ticket || next.candidate.source != hit.candidate.source
         || next.candidate.sha256 != hit.candidate.sha256 || next.proof_catalog_id != hit.proof_catalog_id
         || next.baseline_sha256 != hit.baseline_sha256 || next.baseline_sha256s != hit.baseline_sha256s
+        || next.acoustic_review_version != hit.acoustic_review_version || next.acoustic_pair_sha256s != hit.acoustic_pair_sha256s
         || next.pair_sha256s != hit.pair_sha256s || next.pair_sha256 != hit.pair_sha256 { return None; }
     fetch(&next.candidate).inspect_err(|e| {
         if current() { crate::config::log(format!("Повторная доставка проверенной версии: {}", e.label())); }
@@ -502,9 +779,9 @@ fn deliver_known<T>(
 }
 
 pub fn known_audio(
-    hit: &KnownCandidate, track: &str, token: &str, current: &impl Fn() -> bool, refresh: impl FnOnce() -> Option<KnownCandidate>,
+    hit: &KnownCandidate, track: &str, token: &str, needs_review: bool, current: &impl Fn() -> bool, refresh: impl FnOnce() -> Option<KnownCandidate>,
     load_catalog: impl FnOnce(&str) -> Option<(std::sync::Arc<crate::stream::Buf>, String)>,
-) -> Option<ExternalAudio> {
+) -> Option<(ExternalAudio, String)> {
     let media = hit.candidate.sha256.as_deref()?;
     let pair = hit.cache_key(track)?;
     if hit.is_yandex() {
@@ -513,14 +790,34 @@ pub fn known_audio(
         let response = resolver_login::signed("GET", &path, token, vec![]).ok()?
             .timeout(Duration::from_secs(4)).send().ok()?;
         let (buf, format) = catalog_ticket_audio(response, track, media, current, load_catalog)?;
-        return Some(ExternalAudio { buf, format, cached: false, token: token.into() });
+        return Some((ExternalAudio { buf, format, cached: false, token: token.into() }, hit.candidate.ticket.clone()));
     }
-    let cached = cached_audio(token, track, media, &pair, hit.baseline_sha256.as_deref()).or_else(|| {
-        hit.baseline_sha256s.iter().find_map(|s| cached_audio(token, track, media, &pair_digest(track, s, media), Some(s)))
-    });
+    let cached = if needs_review && hit.acoustic_review_version == Some(ACOUSTIC_POLICY) {
+        // This lease becomes usable only after a full delivery, including when local ASR is cached.
+        None
+    } else {
+        cached_audio(token, track, media, &pair, hit.baseline_sha256.as_deref()).or_else(|| {
+            hit.baseline_sha256s.iter().find_map(|s| cached_audio(token, track, media, &pair_digest(track, s, media), Some(s)))
+        })
+    };
     // First-buffer waiting has its own short deadline. Finish an already matched
     // download in the background even when a slow link takes more than 15 seconds.
-    deliver_known(hit, current, refresh, |ticket| fetch_audio(ticket, token.into(), cached.clone(), Duration::from_secs(48), current))
+    deliver_known(hit, current, refresh, |ticket| {
+        let media = fetch_audio(ticket, token.into(), cached.clone(), Duration::from_secs(48), current)?;
+        Ok((media, ticket.ticket.clone()))
+    })
+}
+
+pub fn remember_known_review(hit: &KnownCandidate, track: &str, baseline: &str, redeemed_ticket: &str, token: &str) {
+    let Some(report) = hit.review_report(track, baseline, redeemed_ticket) else { return };
+    let token = token.to_owned();
+    let revision = resolver_login::session_revision();
+    std::thread::spawn(move || {
+        if resolver_login::session_revision() != revision || !resolver_login::mode_enabled()
+            || !crate::api::allow_explicit() || resolver_login::credential().as_ref() != Some(&token) { return; }
+        send_acoustic_review(&token, &report, &|| resolver_login::session_revision() == revision
+            && resolver_login::mode_enabled() && crate::api::allow_explicit());
+    });
 }
 
 pub fn cache_known(hit: &KnownCandidate, track: &str, audio: &ExternalAudio) {
@@ -530,6 +827,35 @@ pub fn cache_known(hit: &KnownCandidate, track: &str, audio: &ExternalAudio) {
         let buf = audio.buf.clone();
         std::thread::spawn(move || { let _ = confirmed_audio::store(&path, &buf); });
     }
+}
+
+pub(crate) fn known_speech(hit: &KnownCandidate, media: &ExternalAudio, redeemed_ticket: &str) -> Option<std::sync::Arc<crate::verification::remote_speech::Provider>> {
+    // A delivery retry may use a fresh ticket. Only the redeemed ticket owns the
+    // server's byte receipt; Yandex candidates are rejected by candidate_speech.
+    let mut candidate = hit.candidate.clone();
+    candidate.ticket = redeemed_ticket.to_owned();
+    candidate_speech(&candidate,media)
+}
+
+pub(crate) fn candidate_speech(candidate: &OnlineCandidate, result: &ExternalAudio) -> Option<std::sync::Arc<crate::verification::remote_speech::Provider>> {
+    if !candidate.speech || !candidate.valid() || !result.buf.done() { return None; }
+    let sha256 = media_digest(result.buf.reader()).ok()?;
+    let ticket = candidate.ticket.clone();
+    let token = result.token.clone();
+    let revision = resolver_login::session_revision();
+    Some(crate::verification::remote_speech::Provider::new(move |ranges,timeout| {
+        if resolver_login::session_revision() != revision || resolver_login::credential().as_deref() != Some(&token) { return None; }
+        let clips: Vec<_> = ranges.iter().map(|&(from_ms,to_ms)| serde_json::json!({"from_ms":from_ms,"to_ms":to_ms})).collect();
+        let body = serde_json::json!({"ticket":ticket,"sha256":sha256,"clips":clips});
+        let response = post_metadata("/speech", &token, &body, timeout).ok()?.error_for_status().ok()?;
+        use std::io::Read;
+        #[derive(Deserialize)]
+        struct Reply { model: String, sha256: String, clips: Vec<crate::verification::remote_speech::Transcript> }
+        let reply: Reply = serde_json::from_reader(response.take(65536)).ok()?;
+        if reply.model != "gigaam-v4-rnnt-rr-timed-v1" || reply.sha256 != sha256
+            || resolver_login::session_revision() != revision { return None; }
+        Some(reply.clips)
+    }))
 }
 
 pub fn online_audio(candidate: &OnlineCandidate, track: &Track, original: Option<&str>, current: &impl Fn() -> bool) -> Res<ExternalAudio> {
@@ -554,10 +880,39 @@ fn catalog_confirmation(track: &Track, alternative: &str, baseline: &str, media:
     Some(body)
 }
 
+/// The initial confirmation has the .4 body. Only an upgraded service can issue a
+/// fresh owner-bound review lease after it has accepted that exact recording.
+fn confirm_acoustic_pair(path: &str, token: &str, body: &serde_json::Value, current: &impl Fn() -> bool) {
+    if !current() { return; }
+    // A server predating v3 rejects this field instead of recording a sampled
+    // check as a legacy confirmation. The signature commits to the policy in the body.
+    let mut confirmation = body.clone();
+    confirmation["acoustic_policy"] = ACOUSTIC_POLICY.into();
+    let Ok(response) = post_metadata(path, token, &confirmation, Duration::from_secs(8)) else { return };
+    if response.status() != reqwest::StatusCode::OK || !current() { return; }
+    let Ok(lease) = read_json::<serde_json::Value>(response) else { return };
+    let Some(ticket) = lease["ticket"].as_str() else { return };
+    let Some(pair) = body["pair_sha256"].as_str() else { return };
+    if lease["review_version"].as_u64() != Some(u64::from(ACOUSTIC_POLICY)) || lease["pair_sha256"] != pair
+        || ticket.len() != 32 || !ticket.bytes().all(|b| b.is_ascii_hexdigit()) || !digest_valid(pair) { return; }
+    send_acoustic_review(token, &lease, current);
+}
+
+fn send_acoustic_review(token: &str, body: &serde_json::Value, current: &impl Fn() -> bool) {
+    for _ in 0..2 {
+        if !current() { return; }
+        match post_metadata("/known/review", token, body, Duration::from_secs(8)) {
+            Ok(response) if !response.status().is_server_error() => return,
+            _ => {}
+        }
+    }
+}
+
 pub fn remember_catalog(
     track: &Track, alternative: String, baseline: std::sync::Arc<crate::stream::Buf>,
-    media: std::sync::Arc<crate::stream::Buf>, revision: u64,
+    media: std::sync::Arc<crate::stream::Buf>, revision: u64, publishable: bool,
 ) {
+    if !publishable { return; }
     let Some(token) = resolver_login::credential() else { return };
     let track = track.clone();
     std::thread::spawn(move || {
@@ -566,13 +921,11 @@ pub fn remember_catalog(
         let Some(media) = complete_digest(&media, &authorized) else { return };
         let Some(body) = catalog_confirmation(&track, &alternative, &baseline, &media) else { return };
         if !authorized() || resolver_login::credential().as_deref() != Some(&token) { return; }
-        if let Ok(response) = post_metadata("/catalog/confirm", &token, &body, Duration::from_secs(8)) {
-            crate::config::log(format!("Отчёт о проверенной каталожной паре {}: HTTP {}", track.id, response.status().as_u16()));
-        }
+        confirm_acoustic_pair("/catalog/confirm", &token, &body, &authorized);
     });
 }
 
-pub fn remember_external(result: ExternalAudio, candidate: &OnlineCandidate, track: &str, original: Option<&str>) {
+pub fn remember_external(result: ExternalAudio, candidate: &OnlineCandidate, track: &str, original: Option<&str>, publishable: bool) {
     let revision = resolver_login::session_revision();
     let Ok(digest) = confirmed_audio::digest(result.buf.reader()) else { return };
     let mut body = serde_json::json!({"ticket":candidate.ticket,"sha256":digest});
@@ -580,19 +933,115 @@ pub fn remember_external(result: ExternalAudio, candidate: &OnlineCandidate, tra
         let proof = pair_digest(track, original, &digest);
         let path = confirmed_audio::path(&result.token, track, &proof, &digest);
         if !result.cached || !path.exists() { let _ = confirmed_audio::store(&path, &result.buf); }
+        let _ = write_local_review(&local_review_path(&result.token, &proof), &proof);
         body["catalog_id"] = track.into();
         body["pair_sha256"] = proof.into();
     }
+    if original.is_none() { return; }
     std::thread::spawn(move || {
-        if resolver_login::session_revision() != revision || resolver_login::credential().as_deref() != Some(&result.token) { return; }
-        if let Ok(request) = resolver_login::signed("POST", "/confirm", &result.token, body.to_string().into_bytes()) {
-            let _ = request.send();
+        let current = || resolver_login::session_revision() == revision
+            && resolver_login::credential().as_deref() == Some(&result.token)
+            && resolver_login::mode_enabled() && crate::api::allow_explicit();
+        if !current() { return; }
+        if publishable {
+            confirm_acoustic_pair("/confirm", &result.token, &body, &current);
+        } else {
+            // This owner's checked byte pair enables replay without making it a shared verdict.
+            body["local_only"] = true.into();
+            body["acoustic_policy"] = ACOUSTIC_POLICY.into();
+            for _ in 0..2 {
+                if !current() { return; }
+                match post_metadata("/confirm", &result.token, &body, Duration::from_secs(8)) {
+                    Ok(response) if !response.status().is_server_error() => return,
+                    _ => {}
+                }
+            }
         }
     });
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_assistance_does_not_cache_a_negative_and_recovery_is_cached() {
+        use crate::verification::remote_speech::{Provider, Transcript, with_candidate, transcript};
+        let cache = LookupCache::<f32>::default();
+        let pcm = vec![0i16; 16000];
+        with_candidate(&pcm, Provider::new(|_, _| None), || {
+            assert_eq!(cache.find("pair", || {
+                assert!(transcript(&pcm).is_none());
+                assert!(crate::verification::remote_speech::retryable_failure());
+                cacheable_verification(None)
+            }), None);
+        });
+        with_candidate(&pcm, Provider::new(|ranges, _| Some(ranges.iter().map(|&(from_ms,to_ms)|
+            Transcript { from_ms,to_ms,text:"restored".into(),words:vec![] }).collect())), || {
+            assert_eq!(cache.find("pair", || {
+                assert!(transcript(&pcm).is_some());
+                assert!(!crate::verification::remote_speech::incomplete());
+                cacheable_verification(Some(1.0))
+            }), Some(1.0));
+        });
+        assert_eq!(cache.find("pair", || panic!("recovered positive must be cached")), Some(1.0));
+    }
+
+    #[test]
+    fn definitive_negative_and_successful_local_fallback_remain_cached() {
+        use crate::verification::remote_speech::{Provider, with_candidate, transcript};
+        let cache = LookupCache::<f32>::default();
+        assert_eq!(cache.find("negative", || cacheable_verification(None)), None);
+        assert_eq!(cache.find("negative", || panic!("definitive negative must be cached")), None);
+        let pcm = vec![0i16; 16000];
+        with_candidate(&pcm, Provider::new(|_, _| None), || {
+            assert_eq!(cache.find("local-proof", || {
+                assert!(transcript(&pcm).is_none());
+                cacheable_verification(Some(2.0))
+            }), Some(2.0));
+        });
+        assert_eq!(cache.find("local-proof", || panic!("local positive must be cached")), Some(2.0));
+        assert!(!crate::verification::remote_speech::incomplete(), "failure must not leak out of its candidate scope");
+    }
+
+    #[test]
+    fn only_one_complete_positive_omission_check_is_publishable() {
+        use crate::api::{OmissionCheck, OmissionPlan};
+        let check = OmissionCheck {
+            from_ms: 10_000, to_ms: 12_000, missing: "слово".into(),
+            before: ["одно".into(), "два".into()], after: ["три".into(), "четыре".into()],
+        };
+        let mut lyrics = crate::api::Lyrics { text: vec!["обычный несинхронный текст".into()], ..Default::default() };
+        assert!(!publishable_evidence(&lyrics, 11.0), "plain text alone is local-only");
+        lyrics.omission_plan = OmissionPlan::Complete(vec![]);
+        assert!(!publishable_evidence(&lyrics, 11.0), "an empty plan does not establish coverage");
+        lyrics.omission_plan = OmissionPlan::Complete(vec![check.clone()]);
+        assert!(publishable_evidence(&lyrics, 11.0), "a positive target within the sole complete omission window is publishable");
+        assert!(!publishable_evidence(&lyrics, 9.9), "a restoration before the target window is local-only");
+        assert!(!publishable_evidence(&lyrics, 12.1), "a restoration after the target window is local-only");
+        if let OmissionPlan::Complete(checks) = &mut lyrics.omission_plan { checks[0].missing = "слово тест".into(); }
+        assert!(!publishable_evidence(&lyrics, 11.0), "a multiword target needs richer coverage data");
+        lyrics.omission_plan = OmissionPlan::Complete(vec![check.clone(), check]);
+        assert!(!publishable_evidence(&lyrics, 11.0), "the current verifier result does not identify coverage for multiple targets");
+        lyrics.omission_plan = OmissionPlan::Incomplete;
+        assert!(!publishable_evidence(&lyrics, 11.0));
+        lyrics.omission_plan = OmissionPlan::Complete(vec![OmissionCheck {
+            from_ms: 10_000, to_ms: 12_000, missing: "слово".into(),
+            before: ["одно".into(), "два".into()], after: ["три".into(), "четыре".into()],
+        }]);
+        assert!(!publishable_evidence(&lyrics, f32::NAN));
+        assert!(!publishable_evidence(&lyrics, 0.0));
+    }
+
+    #[test]
+    fn saved_fallback_hint_is_optional_on_a_candidate_page() {
+        let mut row = serde_json::json!({"source":"Bandcamp","ticket":"1".repeat(32),"next":"2".repeat(32)});
+        let read = |row| serde_json::from_value::<OnlineCandidate>(row).unwrap();
+        assert!(!read(row.clone()).next_after_rejection);
+        row["next_after_rejection"] = true.into();
+        let candidate = read(row);
+        assert!(candidate.next_after_rejection && candidate.valid());
+        assert_eq!(candidate.next.unwrap(), "2".repeat(32));
+    }
 
     #[test]
     fn known_pairs_bind_both_files_and_personal_proofs_bind_the_catalog_id() {
@@ -619,6 +1068,104 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs licensed local audio, lyrics, a test-only profile and the bundled speech model"]
+    fn licensed_versioned_review_reuses_only_a_current_positive() {
+        use sha2::{Digest, Sha256};
+        let dir = std::path::PathBuf::from(std::env::var_os("YM_ACOUSTIC_FIXTURE").unwrap());
+        assert_eq!(crate::config::dir(), std::path::PathBuf::from(std::env::var_os("YM_TEST_PROFILE").unwrap()));
+        let read = |name| {
+            let decoder = rodio::Decoder::new(std::io::BufReader::new(std::fs::File::open(dir.join(name)).unwrap())).unwrap();
+            crate::verification::Recording::decode(decoder, 218_070).unwrap()
+        };
+        let original = read("media/trial-3/two-silence.mp3");
+        let alternative = read("media/intact.mp3");
+        let row: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("reference.json")).unwrap()).unwrap();
+        let lyrics = crate::api::reference_row(&row, 218_070);
+        assert!(lyrics.synced.is_empty() && !lyrics.text.is_empty());
+        // Reconstruct the real old cache key for the (incorrect) reverse direction.
+        let mut old = Sha256::new();
+        old.update(alternative.digest);
+        old.update(original.digest);
+        for line in &lyrics.text { old.update((line.len() as u64).to_le_bytes()); old.update(line.as_bytes()); }
+        let old = format!("{:x}", old.finalize());
+        let v1 = crate::config::cache_dir().join("restored-speech-v1");
+        std::fs::create_dir_all(&v1).unwrap();
+        std::fs::write(v1.join(&old[..2]), serde_json::to_vec(&(&old, 42.0)).unwrap()).unwrap();
+        let api = Api::new("");
+        let start = Instant::now();
+        assert!(verified(&api,&alternative,&original,&lyrics,&|| true).is_none());
+        let actual = verified(&api,&original,&alternative,&lyrics,&|| true).unwrap();
+        assert!((actual - 43.88).abs() < 0.5);
+        let fresh = start.elapsed();
+        let hits = std::cell::Cell::new(0);
+        let start = Instant::now();
+        // A new API object forces the persistent cache path; fresh ASR calls current repeatedly.
+        let cached = verified(&Api::new(""),&original,&alternative,&lyrics,&|| { hits.set(hits.get()+1); true }).unwrap();
+        assert_eq!(cached,actual);
+        assert_eq!(hits.get(),1);
+        eprintln!("trigger={actual:.3}s reverse_and_positive={fresh:?} new_profile_object_hits={} persistent_read={:?}",hits.get(),start.elapsed());
+    }
+
+    #[test]
+    fn old_shared_receipts_never_serve_as_current_acoustic_proofs() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let pair = pair_digest("7", &a, &b);
+        let mut row = serde_json::json!({"source":"Bandcamp","ticket":"1".repeat(32),"sha256":b,"proof_catalog_id":"7","pair_sha256":pair,
+            "known_review":true,"reviewed_pair_sha256s":[pair]});
+        let old: KnownCandidate = serde_json::from_value(row.clone()).unwrap();
+        assert!(old.matches("7", &a));
+        assert!(!old.reviewed("7", &a));
+        assert!(old.review_report("7", &a, &"1".repeat(32)).is_none());
+        row["acoustic_pair_sha256s"] = serde_json::json!([pair]);
+        assert!(!serde_json::from_value::<KnownCandidate>(row).unwrap().valid("7"));
+    }
+
+    #[test]
+    fn upgrade_uses_redeemed_ticket_and_only_the_offered_unreviewed_pair() {
+        let operator = "a".repeat(64);
+        let old = "b".repeat(64);
+        let media = "c".repeat(64);
+        let pair = pair_digest("17", &old, &media);
+        let row = serde_json::json!({
+            "source":"Bandcamp", "ticket":"1".repeat(32), "sha256":media, "proof_catalog_id":"17",
+            "baseline_sha256":operator, "baseline_sha256s":["d".repeat(64)], "pair_sha256s":[pair], "acoustic_review_version":ACOUSTIC_POLICY
+        });
+        let read = |row: serde_json::Value| serde_json::from_value::<KnownCandidate>(row).unwrap();
+        let mut earlier = row.clone();
+        earlier["acoustic_review_version"] = 2.into();
+        assert!(read(earlier).review_report("17", &old, &"1".repeat(32)).is_none());
+        let hit = read(row.clone());
+        for baseline in [&operator, &"d".repeat(64)] {
+            assert!(hit.matches("17", baseline) && hit.reviewed("17", baseline));
+            assert!(hit.review_report("17", baseline, &hit.candidate.ticket).is_none());
+        }
+        let mut refreshed = row.clone();
+        refreshed["ticket"] = "2".repeat(32).into();
+        let redeemed = deliver_known(&hit, &|| true, || Some(read(refreshed)), |candidate| {
+            if candidate.ticket == hit.candidate.ticket { return Err(AudioError::Transport); }
+            Ok(candidate.ticket.clone())
+        }).unwrap();
+        let report = serde_json::json!({"ticket":"2".repeat(32), "pair_sha256":pair, "review_version":ACOUSTIC_POLICY});
+        assert_eq!(hit.review_report("17", &old, &redeemed), Some(report.clone()));
+        assert!(hit.review_report("18", &old, &redeemed).is_none());
+        assert!(hit.review_report("17", &"e".repeat(64), &redeemed).is_none());
+        assert!(hit.review_report("17", &old, "invalid").is_none());
+        let mut shared = row;
+        shared.as_object_mut().unwrap().remove("baseline_sha256");
+        shared.as_object_mut().unwrap().remove("baseline_sha256s");
+        shared.as_object_mut().unwrap().remove("pair_sha256s");
+        shared["source"] = "Yandex Music".into();
+        shared["pair_sha256"] = pair.clone().into();
+        assert_eq!(read(shared.clone()).review_report("17", &old, &redeemed), Some(report));
+        shared["acoustic_pair_sha256s"] = serde_json::json!([pair]);
+        assert!(read(shared.clone()).review_report("17", &old, &redeemed).is_none());
+        shared.as_object_mut().unwrap().remove("acoustic_review_version");
+        shared.as_object_mut().unwrap().remove("acoustic_pair_sha256s");
+        assert!(read(shared).review_report("17", &old, &redeemed).is_none());
+    }
+
+    #[test]
     fn alternate_commitments_still_bind_each_quality_to_the_exact_media_and_id() {
         let a = "a".repeat(64);
         let b = "b".repeat(64);
@@ -630,6 +1177,15 @@ mod tests {
         let hit: KnownCandidate = serde_json::from_value(row.clone()).unwrap();
         assert!(hit.matches("17", &a) && hit.matches("17", &b));
         assert!(!hit.matches("18", &b) && !hit.matches("17", &"d".repeat(64)));
+        assert!(!hit.reviewed("17", &a));
+        let mut review = row.clone();
+        review["acoustic_review_version"] = 2.into();
+        review["acoustic_pair_sha256s"] = serde_json::json!([second]);
+        let approved = serde_json::from_value::<KnownCandidate>(review.clone()).unwrap();
+        assert!(approved.valid("17") && approved.reviewed("17", &b));
+        assert!(!approved.reviewed("17", &a) && !approved.reviewed("18", &b));
+        review["acoustic_pair_sha256s"] = serde_json::json!(["d".repeat(64)]);
+        assert!(!serde_json::from_value::<KnownCandidate>(review).unwrap().valid("17"));
         let mut different = row.clone();
         different["sha256"] = "d".repeat(64).into();
         assert!(!serde_json::from_value::<KnownCandidate>(different).unwrap().matches("17", &b));
@@ -679,6 +1235,133 @@ mod tests {
         operator_only[0].as_object_mut().unwrap().remove("pair_sha256");
         operator_only[0]["baseline_sha256"] = "b".repeat(64).into();
         assert!(lookup_known("7", "7", metadata, |_| Ok(json_response(200, &operator_only))).is_none());
+    }
+
+    #[test]
+    fn known_retries_one_transient_failure_but_not_empty_or_revoked_sessions() {
+        let metadata = serde_json::json!({"title":"song","artists":["A"],"duration_ms":1000});
+        let data = serde_json::json!([{"source":"Bandcamp","ticket":"1".repeat(32),"sha256":"a".repeat(64),"baseline_sha256":"b".repeat(64)}]);
+        for transient in [None, Some(502), Some(503), Some(504)] {
+            let mut attempts = 0;
+            let hit = retry_known_once(|| {
+                attempts += 1;
+                lookup_known_outcome("7", "7", metadata.clone(), |_| {
+                    if attempts == 1 {
+                        match transient {
+                            Some(status) => Ok(json_response(status, &serde_json::Value::Null)),
+                            None => Err(KnownPostError::Retryable),
+                        }
+                    } else { Ok(json_response(200, &data)) }
+                })
+            }, || true, || {}, || {});
+            assert!(matches!(hit, KnownLookup::Hit(_)));
+            assert_eq!(attempts, 2, "each transient failure gets exactly one retry");
+        }
+
+        {
+            let post_error = KnownPostError::Terminal;
+            let mut attempts = 0;
+            let outcome = retry_known_once(|| {
+                attempts += 1;
+                lookup_known_outcome("7", "7", metadata.clone(), |_| Err(post_error))
+            }, || true, || panic!("signing/other errors must not retry"), || panic!("terminal errors must not wait"));
+            assert_eq!(attempts, 1);
+            assert!(matches!(outcome, KnownLookup::Miss));
+        }
+
+        for (status, body) in [(200, serde_json::json!([])), (401, serde_json::Value::Null), (403, serde_json::Value::Null)] {
+            let mut attempts = 0;
+            let outcome = retry_known_once(|| {
+                attempts += 1;
+                lookup_known_outcome("7", "7", metadata.clone(), |_| Ok(json_response(status, &body)))
+            }, || true, || panic!("terminal outcomes must not wait"), || panic!("terminal outcomes must not wait"));
+            assert_eq!(attempts, 1);
+            match outcome {
+                KnownLookup::Miss => {},
+                KnownLookup::Rejected => {},
+                _ => panic!("empty result and revoked/unauthorized sessions are terminal"),
+            }
+        }
+    }
+
+    #[test]
+    fn known_retries_only_transient_io_error_kinds() {
+        for kind in [std::io::ErrorKind::ConnectionReset, std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe, std::io::ErrorKind::UnexpectedEof, std::io::ErrorKind::TimedOut] {
+            assert!(error_chain_has_transient_io(&std::io::Error::new(kind, "socket closed")));
+        }
+        assert!(!error_chain_has_transient_io(&std::io::Error::new(std::io::ErrorKind::InvalidData, "bad json")));
+    }
+
+    #[test]
+    fn continuation_retries_only_one_explicit_service_failure() {
+        let good = r#"[{"source":"YouTube Music","ticket":"0123456789abcdef0123456789abcdef"}]"#;
+        let response = |status, body: &str| tungstenite::http::Response::builder()
+            .status(status).body(body.as_bytes().to_vec()).unwrap().into();
+        let mut calls = 0;
+        let found = candidate_page("/next", || {
+            calls += 1;
+            Ok(if calls == 1 { response(503, "") } else { response(200, good) })
+        }).unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(found.len(), 1);
+        for (path, status, count) in [("/next",503,2),("/search",503,1),("/next",401,1),("/next",403,1),("/next",404,1),("/next",409,1)] {
+            let mut calls = 0;
+            assert!(candidate_page(path, || { calls += 1; Ok(response(status, "")) }).is_err());
+            assert_eq!(calls, count);
+        }
+        let mut calls = 0;
+        assert!(candidate_page("/next", || { calls += 1; Err("response lost".into()) }).is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn continuation_does_not_repeat_a_slow_upstream_failure() {
+        let mut calls = 0;
+        let result = candidate_page("/next", || {
+            calls += 1;
+            std::thread::sleep(Duration::from_millis(1100));
+            Ok(tungstenite::http::Response::builder().status(503).body(Vec::<u8>::new()).unwrap().into())
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "a timed-out provider must not start a second slow search");
+    }
+
+    #[test]
+    fn known_truncated_metadata_body_is_retryable_transport_but_bad_json_is_terminal() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let peer = std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut input = std::io::BufReader::new(&stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if input.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n[]").unwrap();
+            stream.flush().unwrap();
+        });
+        let response = reqwest::blocking::Client::builder().no_proxy().timeout(Duration::from_secs(2))
+            .build().unwrap().get(endpoint).send().unwrap();
+        peer.join().unwrap();
+        assert!(matches!(read_known_hits(response), Err(KnownLookup::Retryable)));
+
+        let malformed = tungstenite::http::Response::builder().status(200).body(b"{".to_vec()).unwrap().into();
+        assert!(matches!(read_known_hits(malformed), Err(KnownLookup::Miss)));
+    }
+
+    #[test]
+    fn known_retry_stops_when_track_is_cancelled() {
+        let mut attempts = 0;
+        let active = std::cell::Cell::new(true);
+        let outcome = retry_known_once(|| {
+            attempts += 1;
+            KnownLookup::Retryable
+        }, || active.get(), || {}, || active.set(false));
+        assert_eq!(attempts, 1);
+        assert!(matches!(outcome, KnownLookup::Miss));
     }
 
     #[test]
@@ -800,6 +1483,26 @@ mod tests {
     }
 
     #[test]
+    fn catalog_matches_editions_with_separately_listed_confirmed_guests() {
+        let make = |id, version, guest_id| crate::api::parse_track(&serde_json::json!({
+            "id":id, "title":"Song", "durationMs":225500, "version":version, "explicit":true,
+            "artists":[{"id":1,"name":"Lead"},{"id":guest_id,"name":"Guest"}]
+        })).unwrap();
+        for label in ["Remix; feat. Guest", "featuring Guest; Remix", "Remix ; FEAT. Guest"] {
+            let original = make(7, label, 2);
+            assert_eq!(catalog_candidates(&original, &[make(8, "Remix", 2)]), ["8"]);
+            assert_eq!(catalog_candidates(&make(7, "Remix", 2), &[make(8, label, 2)]), ["8"]);
+            for other in ["", "Live", "Remix; Live", "Remix; feat. Stranger", "Remix; feat. Guest Live"] {
+                assert!(catalog_candidates(&original, &[make(8, other, 2)]).is_empty());
+            }
+            assert!(catalog_candidates(&original, &[make(8, "Remix", 3)]).is_empty());
+        }
+        // Catalog normalization must not change existing service/cache metadata.
+        let original = make(7, "Remix; feat. Guest", 2);
+        assert_eq!(public_metadata(&original).unwrap()["title"], "song (remix; feat. guest)");
+    }
+
+    #[test]
     fn known_delivery_retries_transient_errors_once_with_a_fresh_ticket_for_the_same_proof() {
         let digest = media_digest(b"verified".as_slice()).unwrap();
         let make = |ticket: &str, pair: &str| serde_json::from_value::<KnownCandidate>(serde_json::json!({
@@ -874,8 +1577,32 @@ mod tests {
         assert!(ticket_audio(response(304, b""), Some(&hash), None, &|| true).is_err());
         let buf = ticket_audio(response(200, b"expected"), Some(&hash), None, &|| true).unwrap();
         assert!(ticket_audio(response(403, b""), Some(&hash), Some(buf.clone()), &|| true).is_err());
-        let cached = ticket_audio(response(304, b""), Some(&hash), Some(buf.clone()), &|| true).unwrap();
+        assert!(ticket_audio(response(304, b""), Some(&hash), Some(buf.clone()), &|| true).is_err());
+        let tagged = |digest: &str| tungstenite::http::Response::builder().status(304)
+            .header("etag",format!(r#""{digest}""#)).body(Vec::<u8>::new()).unwrap().into();
+        assert!(ticket_audio(tagged(&"a".repeat(64)), Some(&hash), Some(buf.clone()), &|| true).is_err());
+        let cached = ticket_audio(tagged(&hash), Some(&hash), Some(buf.clone()), &|| true).unwrap();
         assert!(std::sync::Arc::ptr_eq(&buf, &cached));
+    }
+
+    #[test]
+    fn personal_replay_marker_requires_its_session_and_exact_pair() {
+        let baseline = "b".repeat(64);
+        let media = "a".repeat(64);
+        let pair = pair_digest("123", &baseline, &media);
+        let hit: KnownCandidate = serde_json::from_value(serde_json::json!({
+            "source":"Bandcamp","ticket":"1".repeat(32),"sha256":media,"pair_sha256":pair,
+            "proof_catalog_id":"123","acoustic_review_version":3
+        })).unwrap();
+        let token = format!("fixture-{}-{}", std::process::id(), pair);
+        hit.remember_local_review("123", &baseline, &token);
+        assert!(hit.has_local_review("123", &token));
+        assert!(hit.locally_reviewed("123", &baseline, &token));
+        assert!(!hit.has_local_review("123", "another account"));
+        assert!(!hit.locally_reviewed("123", &"c".repeat(64), &token));
+        assert!(!hit.locally_reviewed("124", &baseline, &token));
+        assert!(!hit.reviewed("123", &baseline), "local replay is not a shared receipt");
+        let _ = std::fs::remove_file(local_review_path(&token, &pair));
     }
 
     #[test]
@@ -918,6 +1645,35 @@ mod tests {
     }
 
     #[test]
+    fn local_review_is_bound_to_track_and_both_files_and_does_not_accept_a_bucket_collision() {
+        let path = std::env::temp_dir().join(format!("ym-local-review-test-{}",std::process::id()));
+        let pair = pair_digest("7", &"a".repeat(64), &"b".repeat(64));
+        write_local_review(&path, &pair).unwrap();
+        assert!(read_local_review(&path, &pair));
+        for other in [pair_digest("8", &"a".repeat(64), &"b".repeat(64)),
+            pair_digest("7", &"c".repeat(64), &"b".repeat(64)),
+            pair_digest("7", &"a".repeat(64), &"c".repeat(64))] {
+            assert!(!read_local_review(&path,&other));
+        }
+        std::fs::write(&path,b"explicit_badge").unwrap();
+        assert!(!read_local_review(&path,&pair));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn explicit_metadata_cannot_establish_a_verified_pair() {
+        for edition in ["explicit_badge", "explicit_version", "uncensored"] {
+            let row = serde_json::json!({"source":"YouTube Music", "ticket":"a".repeat(32),
+                "edition":edition, "sha256":"b".repeat(64)});
+            let candidate: OnlineCandidate = serde_json::from_value(row.clone()).unwrap();
+            assert!(candidate.valid()); // Searchable, but not a proof of restoration.
+            let known: KnownCandidate = serde_json::from_value(row).unwrap();
+            assert!(!known.has_fast_proof());
+            assert!(!known.valid("7"));
+        }
+    }
+
+    #[test]
     fn catalog_finds_an_explicit_copy_of_the_same_recording() {
         let make = |id, title, version, duration, artist_id, explicit| crate::api::parse_track(&serde_json::json!({
             "id": id, "title": title, "version": version, "durationMs": duration, "explicit": explicit,
@@ -931,6 +1687,6 @@ mod tests {
         let hits = [wrong_artist, long, remix, match_track];
         assert_eq!(catalog_candidates(&clean, &hits), vec!["5"]);
         let unknown = make(6, "Song", "", 120000, 10, true);
-        assert!(catalog_candidates(&unknown, &hits).is_empty());
+        assert_eq!(catalog_candidates(&unknown, &hits), ["5"]);
     }
 }

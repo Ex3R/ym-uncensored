@@ -417,6 +417,8 @@ pub fn cleanup() {
     let _ = std::fs::remove_file(crate::config::dir().join("hwnd"));
 }
 
+// Tests use isolated profile directories instead of platform storage.
+#[cfg_attr(test, allow(dead_code))]
 pub fn config_base() -> PathBuf {
     PathBuf::from(std::env::var("APPDATA").unwrap_or_else(|_| ".".into()))
 }

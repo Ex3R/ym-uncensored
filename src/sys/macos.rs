@@ -173,10 +173,14 @@ fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
 }
 
+// Tests use isolated profile directories instead of platform storage.
+#[cfg_attr(test, allow(dead_code))]
 pub fn config_base() -> PathBuf {
     home().join("Library").join("Application Support")
 }
 
+// Tests use isolated profile directories instead of platform storage.
+#[cfg_attr(test, allow(dead_code))]
 pub fn cache_base() -> PathBuf {
     home().join("Library").join("Caches")
 }

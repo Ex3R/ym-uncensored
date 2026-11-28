@@ -140,10 +140,14 @@ fn xdg(var: &str, fallback: &str) -> PathBuf {
     std::env::var_os(var).map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home().join(fallback))
 }
 
+// Tests use isolated profile directories instead of platform storage.
+#[cfg_attr(test, allow(dead_code))]
 pub fn config_base() -> PathBuf {
     xdg("XDG_CONFIG_HOME", ".config")
 }
 
+// Tests use isolated profile directories instead of platform storage.
+#[cfg_attr(test, allow(dead_code))]
 pub fn cache_base() -> PathBuf {
     xdg("XDG_CACHE_HOME", ".cache")
 }
