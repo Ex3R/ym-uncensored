@@ -1184,7 +1184,13 @@ fn restored_time(original: &Recording, candidate: &Recording, lyrics: &Lyrics, l
         if windows.is_empty() { return None; }
         // full() replaces the output segments; no_context keeps each clip independent.
         let mut state = model.create_state().ok()?;
-        windows.iter().take_while(|_| current()).find_map(|window| {
+        windows.iter().enumerate().take_while(|_| current()).find_map(|(index, window)| {
+            // Keep the first cue immediate. Once it fails, amortize later network
+            // round trips over at most two cues; local recognition stays lazy.
+            if index % 2 == 1 {
+                remote_speech::prefetch(windows[index..windows.len().min(index + 2)].iter()
+                    .flat_map(|window| [window.candidate, window.baseline]));
+            }
             let added = transcript(window.candidate, &mut state)?;
             let prefilter = restored(&[], &added, &window.expected);
             let local_candidate = !prefilter

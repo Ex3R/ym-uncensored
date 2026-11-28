@@ -153,6 +153,23 @@ mod tests {
         assert!(transcript(&candidate[16000..48000]).is_none());
         assert_eq!(calls.load(Ordering::Relaxed),1);
     }
+    #[test] fn prefetched_cue_pair_excludes_original_audio_and_reuses_both_results() {
+        let candidate=vec![0i16;16000*8]; let baseline=vec![0i16;16000*8];
+        let calls=Arc::new(AtomicUsize::new(0)); let seen=calls.clone();
+        let provider=Provider::new(move |ranges,_| {
+            seen.fetch_add(1,Ordering::Relaxed);
+            assert_eq!(ranges,&[(1000,3000),(4000,6000)]);
+            answer(ranges)
+        });
+        with_candidate(&candidate,provider,|| {
+            prefetch([&candidate[16000..48000],&baseline[16000..48000],
+                &candidate[64000..96000],&baseline[64000..96000]]);
+            assert!(transcript(&candidate[16000..48000]).is_some());
+            assert!(transcript(&candidate[64000..96000]).is_some());
+            assert!(transcript(&baseline[16000..48000]).is_none());
+        });
+        assert_eq!(calls.load(Ordering::Relaxed),1);
+    }
     #[test] fn local_recognition_does_not_consume_the_remaining_network_budget() {
         use std::time::{Duration,Instant};
         let candidate=vec![0i16;16000*4];
